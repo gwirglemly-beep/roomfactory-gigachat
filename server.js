@@ -59,7 +59,7 @@ async function editImage(token, fileId, prompt) {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'GigaChat',
+    model: 'GigaChat-2-Max',
       messages: [{ role: 'user', content: prompt, attachments: [fileId] }],
       function_call: 'auto'
     })
