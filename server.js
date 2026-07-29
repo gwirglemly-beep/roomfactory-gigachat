@@ -54,7 +54,6 @@ async function uploadImage(token, buffer, filename, mimetype) {
   const data = JSON.parse(text);
   return data.id;
 }
-
 async function describeImage(token, fileId) {
   const resp = await fetch(API_BASE + '/chat/completions', {
     method: 'POST',
@@ -63,10 +62,8 @@ async function describeImage(token, fileId) {
       model: 'GigaChat-2-Max',
       messages: [{
         role: 'user',
-        content: [
-          { text: 'Подробно опиши планировку комнаты на фото для дизайнера интерьера: сколько окон и на какой стене они расположены (по центру или сбоку), где находятся двери, примерная форма и пропорции помещения, тип комнаты. Только фактическое описание расположения объектов, без творческих добавлений.' },
-          { files: [{ id: fileId }] }
-        ]
+        content: 'Подробно опиши планировку комнаты на прикреплённом фото для дизайнера интерьера: сколько окон и на какой стене они расположены, где находятся двери, примерная форма и пропорции помещения, тип комнаты. Только фактическое описание расположения объектов.',
+        attachments: [fileId]
       }]
     })
   });
@@ -77,6 +74,7 @@ async function describeImage(token, fileId) {
   if (!content || typeof content !== 'string') throw new Error('no description: ' + text);
   return content;
 }
+
 
 async function generateImage(token, description, stylePrompt) {
   const fullPrompt = 'Нарисуй фотореалистичный интерьер комнаты в этом стиле: ' + stylePrompt + '. Планировка комнаты, обязательно сохрани точное расположение окон, дверей и форму помещения как описано здесь: ' + description;
