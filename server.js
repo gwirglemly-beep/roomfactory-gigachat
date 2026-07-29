@@ -51,21 +51,46 @@ async function uploadImage(token, buffer, filename, mimetype) {
   });
   const text = await resp.text();
   if (!resp.ok) throw new Error('upload ' + resp.status + ': ' + text);
-  return JSON.parse(text).id;
+  const data = JSON.parse(text);
+  return data.id;
 }
 
-async function editImage(token, fileId, prompt) {
+async function describeImage(token, fileId) {
   const resp = await fetch(API_BASE + '/chat/completions', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-    model: 'GigaChat-2-Max',
-      messages: [{ role: 'user', content: prompt, attachments: [fileId] }],
+      model: 'GigaChat-2-Max',
+      messages: [{
+        role: 'user',
+        content: [
+          { text: 'Подробно опиши планировку комнаты на фото для дизайнера интерьера: сколько окон и на какой стене они расположены (по центру или сбоку), где находятся двери, примерная форма и пропорции помещения, тип комнаты. Только фактическое описание расположения объектов, без творческих добавлений.' },
+          { files: [{ id: fileId }] }
+        ]
+      }]
+    })
+  });
+  const text = await resp.text();
+  if (!resp.ok) throw new Error('describe ' + resp.status + ': ' + text);
+  const data = JSON.parse(text);
+  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  if (!content || typeof content !== 'string') throw new Error('no description: ' + text);
+  return content;
+}
+
+async function generateImage(token, description, stylePrompt) {
+  const fullPrompt = 'Нарисуй фотореалистичный интерьер комнаты в этом стиле: ' + stylePrompt + '. Планировка комнаты, обязательно сохрани точное расположение окон, дверей и форму помещения как описано здесь: ' + description;
+  const resp = await fetch(API_BASE + '/chat/completions', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'GigaChat-2-Max',
+      messages: [{ role: 'user', content: fullPrompt }],
       function_call: 'auto'
     })
   });
   const text = await resp.text();
-  if (!resp.ok) throw new Error('chat ' + resp.status + ': ' + text);
+  if (!resp.ok) throw new Error('generate ' + resp.status + ': ' + text);
   const data = JSON.parse(text);
   const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
   const match = content.match(/img[^>]*src="([^"]+)"/) || content.match(/([0-9a-f-]{20,})/i);
@@ -79,7 +104,8 @@ async function downloadImage(token, fileId) {
     headers: { 'Authorization': 'Bearer ' + token }
   });
   if (!resp.ok) throw new Error('download ' + resp.status);
-  return Buffer.from(await resp.arrayBuffer());
+  const ab = await resp.arrayBuffer();
+  return Buffer.from(ab);
 }
 
 app.post('/generate', upload.single('image'), async (req, res) => {
@@ -87,11 +113,12 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     if (!req.file) { res.status(400).json({ error: 'no image' }); return; }
     const prompt = req.body.prompt || '';
     const comment = req.body.comment || '';
-    const fullPrompt = 'Перерисуй интерьер на этом фото: ' + [prompt, comment].filter(Boolean).join(', ') + '. Сохрани планировку комнаты — те же стены, окна, двери и пропорции.';
+    const stylePrompt = [prompt, comment].filter(Boolean).join(', ');
 
     const token = await getAccessToken();
     const fileId = await uploadImage(token, req.file.buffer, req.file.originalname, req.file.mimetype);
-    const resultFileId = await editImage(token, fileId, fullPrompt);
+    const description = await describeImage(token, fileId);
+    const resultFileId = await generateImage(token, description, stylePrompt);
     const imageBuffer = await downloadImage(token, resultFileId);
 
     res.set('Content-Type', 'image/jpeg');
