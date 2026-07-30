@@ -54,6 +54,7 @@ async function uploadImage(token, buffer, filename, mimetype) {
   const data = JSON.parse(text);
   return data.id;
 }
+
 async function describeImage(token, fileId) {
   const resp = await fetch(API_BASE + '/chat/completions', {
     method: 'POST',
@@ -75,9 +76,20 @@ async function describeImage(token, fileId) {
   return content;
 }
 
+async function generateImage(token, description, stylePrompt, meta) {
+  meta = meta || {};
+  const fullPrompt = [
+    'Нарисуй фотореалистичный интерьер комнаты.',
+    meta.roomLabel ? 'Тип помещения: строго ' + meta.roomLabel + '. Результат обязательно должен выглядеть именно как ' + meta.roomLabel.toLowerCase() + ' — это самое важное условие.' : '',
+    meta.colorLabel ? 'Основная цветовая гамма: строго ' + meta.colorLabel + '. Стены, мебель и текстиль должны быть выдержаны именно в этой цветовой гамме.' : '',
+    meta.styleLabel ? 'Стиль интерьера: ' + meta.styleLabel + '.' : '',
+    'Дополнительные пожелания по стилю и мебели: ' + stylePrompt + '.',
+    'Планировка: сохрани точное расположение окон, дверей и форму помещения, как описано здесь: ' + description,
+    (meta.roomLabel || meta.colorLabel)
+      ? 'Ещё раз главное условие: это ' + (meta.roomLabel ? meta.roomLabel.toLowerCase() : 'комната') + (meta.colorLabel ? ' в цветовой гамме "' + meta.colorLabel + '"' : '') + '.'
+      : ''
+  ].filter(Boolean).join(' ');
 
-async function generateImage(token, description, stylePrompt) {
-  const fullPrompt = 'Нарисуй фотореалистичный интерьер комнаты в этом стиле: ' + stylePrompt + '. Планировка комнаты, обязательно сохрани точное расположение окон, дверей и форму помещения как описано здесь: ' + description;
   const resp = await fetch(API_BASE + '/chat/completions', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
@@ -111,12 +123,15 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     if (!req.file) { res.status(400).json({ error: 'no image' }); return; }
     const prompt = req.body.prompt || '';
     const comment = req.body.comment || '';
+    const roomLabel = req.body.roomLabel || '';
+    const colorLabel = req.body.colorLabel || '';
+    const styleLabel = req.body.styleLabel || '';
     const stylePrompt = [prompt, comment].filter(Boolean).join(', ');
 
     const token = await getAccessToken();
     const fileId = await uploadImage(token, req.file.buffer, req.file.originalname, req.file.mimetype);
     const description = await describeImage(token, fileId);
-    const resultFileId = await generateImage(token, description, stylePrompt);
+    const resultFileId = await generateImage(token, description, stylePrompt, { roomLabel, colorLabel, styleLabel });
     const imageBuffer = await downloadImage(token, resultFileId);
 
     res.set('Content-Type', 'image/jpeg');
