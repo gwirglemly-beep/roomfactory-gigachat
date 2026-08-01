@@ -108,18 +108,22 @@ async function generateImage(token, description, stylePrompt, meta) {
   meta = meta || {};
   const requiredFurniture = roomFurnitureRu[meta.roomLabel];
   const styleDetails = styleDetailsRu[meta.styleLabel];
+
+  const leadParts = ['Нарисуй фотореалистичный интерьер'];
+  if (meta.roomLabel) leadParts.push('— ' + meta.roomLabel.toLowerCase());
+  if (meta.styleLabel) leadParts.push('в стиле «' + meta.styleLabel + '»');
+  if (meta.colorLabel) leadParts.push('ЦВЕТОВАЯ ГАММА (обязательна к соблюдению на стенах, полу, крупной мебели): ' + meta.colorLabel);
+  const lead = leadParts.join(', ') + '.';
+
   const fullPrompt = [
-    'Нарисуй фотореалистичный интерьер комнаты.',
-    meta.roomLabel ? 'Тип помещения: строго ' + meta.roomLabel + '. Результат обязательно должен выглядеть именно как ' + meta.roomLabel.toLowerCase() + ' — это самое важное условие.' : '',
+    lead,
+    meta.colorLabel ? 'Повторяю: цветовая гамма — ' + meta.colorLabel + '. Это условие важнее типичных материалов и цветов для этого стиля — даже если для стиля обычно характерны другие оттенки (например, бетон для минимализма или тёмные тона для лофта), стены, пол и мебель всё равно должны быть перекрашены в указанную гамму, а фактуру и форму сохрани стилевую.' : '',
+    styleDetails ? 'Что означает стиль «' + meta.styleLabel + '»: ' + styleDetails + '.' : '',
     requiredFurniture ? 'В комнате обязательно должна присутствовать мебель, характерная именно для этого типа помещения: ' + requiredFurniture + '. Расставь её как в реальной обставленной комнате, а не одним случайным предметом посередине.' : '',
-    meta.styleLabel ? 'Стиль интерьера: строго ' + meta.styleLabel + '.' + (styleDetails ? ' Это означает: ' + styleDetails + '.' : '') : '',
-    meta.colorLabel ? 'Основная цветовая гамма: строго ' + meta.colorLabel + '. ВАЖНО: цвет стен, пола и мебели должен соответствовать именно этой гамме — даже если для выбранного стиля обычно характерны другие материалы или оттенки (например, бетон для минимализма или тёмные тона для лофта), перекрась эти поверхности в выбранную гамму, сохранив при этом фактуру и форму, характерную для стиля. Цветовая гамма важнее типичных цветов стиля.' : '',
     'Дополнительные пожелания по стилю и мебели: ' + stylePrompt + '.',
     'Планировка помещения (строго обязательно к соблюдению): сохрани точно такую же форму и пропорции комнаты, высоту потолков, такой же ракурс и точку обзора камеры, и такое же количество и расположение окон и дверей, как описано ниже. Не добавляй новые окна, двери или стены и не меняй их положение и размер: ' + description,
     'Не добавляй в кадр животных, людей, посторонние предметы или декор, не относящийся к интерьеру комнаты.',
-    (meta.roomLabel || meta.colorLabel)
-      ? 'Ещё раз главное условие: это ' + (meta.roomLabel ? meta.roomLabel.toLowerCase() : 'комната') + (meta.colorLabel ? ' в цветовой гамме "' + meta.colorLabel + '"' : '') + (meta.styleLabel ? ' в стиле "' + meta.styleLabel + '"' : '') + (requiredFurniture ? ', с реальной обстановкой (' + requiredFurniture + ')' : '') + '.'
-      : ''
+    meta.colorLabel ? 'Ещё раз главное условие, самое важное: цветовая гамма комнаты — ' + meta.colorLabel + '.' : ''
   ].filter(Boolean).join(' ');
 
   const resp = await fetch(API_BASE + '/chat/completions', {
