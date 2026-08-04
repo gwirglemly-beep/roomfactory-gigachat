@@ -107,12 +107,16 @@ const styleDetailsRu = {
 
 async function generateImage(token, description, stylePrompt, meta) {
   meta = meta || {};
-  const requiredFurniture = roomFurnitureRu[meta.roomLabel];
+  const furnitureBits = [];
+  if (roomFurnitureRu[meta.roomLabel]) furnitureBits.push(roomFurnitureRu[meta.roomLabel]);
+  if (meta.extraFurniture) furnitureBits.push(meta.extraFurniture);
+  const requiredFurniture = furnitureBits.join(', ');
   const styleDetails = styleDetailsRu[meta.styleLabel];
 
   const geoParts = [];
   if (meta.roomShape) geoParts.push('форма помещения — ' + meta.roomShape.toLowerCase());
   if (meta.roomArea) geoParts.push('площадь примерно ' + meta.roomArea + ' м²');
+  if (meta.windowCount !== undefined && meta.windowCount !== '') geoParts.push('точное количество окон — ' + meta.windowCount + (Number(meta.windowCount) === 0 ? ' (окон нет вообще, не рисуй ни одного окна)' : ''));
   const geoNote = geoParts.join(', ');
 
   const leadParts = ['Нарисуй фотореалистичный интерьер'];
@@ -120,21 +124,21 @@ async function generateImage(token, description, stylePrompt, meta) {
   if (meta.styleLabel) leadParts.push('в стиле «' + meta.styleLabel + '»');
   if (requiredFurniture) leadParts.push('ОБЯЗАТЕЛЬНАЯ МЕБЕЛЬ (без неё результат неверный): ' + requiredFurniture);
   if (meta.colorLabel) leadParts.push('ЦВЕТОВАЯ ГАММА (обязательна к соблюдению на стенах, полу, крупной мебели): ' + meta.colorLabel);
-  if (geoNote) leadParts.push('ТОЧНЫЕ ДАННЫЕ О КОМНАТЕ ОТ ПОЛЬЗОВАТЕЛЯ: ' + geoNote);
+  if (geoNote) leadParts.push('ТОЧНЫЕ ДАННЫЕ О КОМНАТЕ ОТ ПОЛЬЗОВАТЕЛЯ (используй вместо своей оценки по фото): ' + geoNote);
   const lead = leadParts.join(', ') + '.';
 
   const fullPrompt = [
     lead,
-    geoNote ? 'Повторяю про геометрию комнаты: пользователь лично указал следующие точные данные — ' + geoNote + '. Это достовернее, чем твоя собственная оценка по фото, — используй именно эти данные о форме и площади, а не своё впечатление от снимка, если они расходятся.' : '',
-    requiredFurniture ? 'Повторяю про мебель: в комнате обязательно должна присутствовать ' + requiredFurniture + '. Это не пожелание, а обязательное требование — расставь её как в реальной обставленной комнате, а не одним случайным предметом посередине, и не заменяй на другую мебель (например, если нужна кровать — рисуй именно кровать, а не диван или кресло).' : '',
+    geoNote ? 'Повторяю про геометрию комнаты: пользователь лично указал следующие точные данные — ' + geoNote + '. Это достовернее, чем твоя собственная оценка по фото, — используй именно эти данные, а не своё впечатление от снимка, если они расходятся.' : '',
+    requiredFurniture ? 'Повторяю про мебель: в комнате обязательно должна присутствовать вся следующая мебель: ' + requiredFurniture + '. Это не пожелание, а обязательное требование — расставь её как в реальной обставленной комнате, а не одним случайным предметом посередине, и не заменяй ни один из этих предметов на другой (например, если нужна кровать — рисуй именно кровать, а не диван или кресло).' : '',
     meta.colorLabel ? 'Повторяю: цветовая гамма — ' + meta.colorLabel + '. Это условие важнее типичных материалов и цветов для этого стиля — даже если для стиля обычно характерны другие оттенки (например, бетон для минимализма или тёмные тона для лофта), стены, пол и мебель всё равно должны быть перекрашены в указанную гамму, а фактуру и форму сохрани стилевую.' : '',
     styleDetails ? 'Что означает стиль «' + meta.styleLabel + '»: ' + styleDetails + '.' : '',
     'Дополнительные пожелания по стилю и мебели: ' + stylePrompt + '.',
-    'Планировка помещения (строго обязательно к соблюдению): сохрани такую же форму, пропорции и общий размер комнаты (если она большая и просторная — не превращай в маленькую, и наоборот), высоту потолков, такой же ракурс и точку обзора камеры, и такое же количество и расположение окон и дверей, как описано ниже' + (geoNote ? ' (но форму и площадь бери из данных пользователя выше, если они отличаются от твоего впечатления по фото)' : '') + ': ' + description,
-    'КРИТИЧЕСКИ ВАЖНО про окна и двери: нарисуй ровно столько окон, сколько указано в описании выше — ни одним больше. Если в описании одно окно, в результате должно быть только одно окно, не два и не три. То же самое для дверей: если в описании сказано, что дверь не видна в кадре или отсутствует, НЕ рисуй дверь вообще — в этом месте должна быть просто сплошная стена, без двери и дверного проёма. Строго запрещено добавлять любые окна, двери, стены, ниши или архитектурные элементы, которых нет в описании.',
+    'Планировка помещения (строго обязательно к соблюдению): сохрани такую же форму, пропорции и общий размер комнаты (если она большая и просторная — не превращай в маленькую, и наоборот), высоту потолков, такой же ракурс и точку обзора камеры, и такое же количество и расположение окон и дверей, как описано ниже' + (geoNote ? ' (но форму, площадь и число окон бери из точных данных пользователя выше, если они отличаются от твоего впечатления по фото)' : '') + ': ' + description,
+    'КРИТИЧЕСКИ ВАЖНО про окна и двери: нарисуй ' + (meta.windowCount !== undefined && meta.windowCount !== '' ? 'ровно ' + meta.windowCount + ' окон(а) — именно столько, сколько указал пользователь' : 'ровно столько окон, сколько указано в описании выше') + ' — ни одним больше. Если окно одно, в результате должно быть только одно окно, не два и не три. То же самое для дверей: если сказано, что дверь не видна в кадре или отсутствует, НЕ рисуй дверь вообще — в этом месте должна быть просто сплошная стена, без двери и дверного проёма. Строго запрещено добавлять любые окна, двери, стены, ниши или архитектурные элементы, которых нет в описании или в данных пользователя.',
     'Не добавляй в кадр животных, людей, посторонние предметы или декор, не относящийся к интерьеру комнаты.',
     (meta.colorLabel || requiredFurniture || geoNote)
-      ? 'Ещё раз главные условия, самые важные: ' + [geoNote ? 'геометрия комнаты — ' + geoNote : '', requiredFurniture ? 'обязательно ' + requiredFurniture : '', meta.colorLabel ? 'цветовая гамма — ' + meta.colorLabel : ''].filter(Boolean).join('; ') + '.'
+      ? 'Ещё раз главные условия, самые важные: ' + [geoNote ? 'геометрия комнаты — ' + geoNote : '', requiredFurniture ? 'обязательно вся мебель: ' + requiredFurniture : '', meta.colorLabel ? 'цветовая гамма — ' + meta.colorLabel : ''].filter(Boolean).join('; ') + '.'
       : ''
   ].filter(Boolean).join(' ');
 
@@ -176,12 +180,14 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     const styleLabel = req.body.styleLabel || '';
     const roomShape = req.body.roomShape || '';
     const roomArea = req.body.roomArea || '';
+    const windowCount = req.body.windowCount || '';
+    const extraFurniture = req.body.extraFurniture || '';
     const stylePrompt = [prompt, comment].filter(Boolean).join(', ');
 
     const token = await getAccessToken();
     const fileId = await uploadImage(token, req.file.buffer, req.file.originalname, req.file.mimetype);
     const description = await describeImage(token, fileId);
-    const resultFileId = await generateImage(token, description, stylePrompt, { roomLabel, colorLabel, styleLabel, roomShape, roomArea });
+    const resultFileId = await generateImage(token, description, stylePrompt, { roomLabel, colorLabel, styleLabel, roomShape, roomArea, windowCount, extraFurniture });
     const imageBuffer = await downloadImage(token, resultFileId);
 
     res.set('Content-Type', 'image/jpeg');
