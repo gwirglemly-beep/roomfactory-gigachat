@@ -9,6 +9,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Furniture-List');
   if (req.method === 'OPTIONS') { res.sendStatus(200); return; }
   next();
 });
@@ -160,6 +161,44 @@ async function generateImage(token, description, stylePrompt, meta) {
   return match[1];
 }
 
+const FURNITURE_TYPE_WORDS = ['диван', 'кресло', 'кровать', 'стол', 'стул', 'шкаф', 'полка', 'зеркало', 'ковёр', 'светильник', 'тумба', 'комод', 'пуф'];
+const FURNITURE_COLOR_WORDS = ['белый', 'бежевый', 'серый', 'чёрный', 'коричневый', 'зелёный', 'синий', 'розовый', 'жёлтый'];
+
+async function describeGeneratedFurniture(token, fileId) {
+  try {
+    const resp = await fetch(API_BASE + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'GigaChat-2-Max',
+        messages: [{
+          role: 'user',
+          content: 'Ты видишь готовую картинку интерьера комнаты. Перечисли всю мебель на ней, не более 5 предметов. ' +
+            'Для типа мебели используй ровно одно слово из этого списка: ' + FURNITURE_TYPE_WORDS.join(', ') + ' — выбери максимально близкое слово, даже если предмет не идеально ему соответствует. ' +
+            'Для цвета используй ровно одно слово из этого списка: ' + FURNITURE_COLOR_WORDS.join(', ') + ' — выбери ближайший цвет. ' +
+            'Не пиши ничего, кроме списка. Формат строго построчно: тип - цвет. Пример:\nкровать - коричневый\nстол - белый\nполка - коричневый',
+          attachments: [fileId]
+        }]
+      })
+    });
+    const text = await resp.text();
+    if (!resp.ok) return [];
+    const data = JSON.parse(text);
+    const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+    const items = [];
+    content.split('\n').forEach(line => {
+      const m = line.match(/([а-яё]+)\s*-\s*([а-яё]+)/i);
+      if (!m) return;
+      const type = m[1].toLowerCase().trim();
+      const color = m[2].toLowerCase().trim();
+      if (FURNITURE_TYPE_WORDS.includes(type) && FURNITURE_COLOR_WORDS.includes(color)) items.push({ type, color });
+    });
+    return items;
+  } catch (e) {
+    return [];
+  }
+}
+
 async function downloadImage(token, fileId) {
   const resp = await fetch(API_BASE + '/files/' + fileId + '/content', {
     method: 'GET',
@@ -188,9 +227,13 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     const fileId = await uploadImage(token, req.file.buffer, req.file.originalname, req.file.mimetype);
     const description = await describeImage(token, fileId);
     const resultFileId = await generateImage(token, description, stylePrompt, { roomLabel, colorLabel, styleLabel, roomShape, roomArea, windowCount, extraFurniture });
-    const imageBuffer = await downloadImage(token, resultFileId);
+    const [imageBuffer, furnitureList] = await Promise.all([
+      downloadImage(token, resultFileId),
+      describeGeneratedFurniture(token, resultFileId)
+    ]);
 
     res.set('Content-Type', 'image/jpeg');
+    res.set('X-Furniture-List', encodeURIComponent(JSON.stringify(furnitureList)));
     res.send(imageBuffer);
   } catch (err) {
     console.error(err);
