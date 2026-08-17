@@ -241,6 +241,40 @@ app.post('/generate', upload.single('image'), async (req, res) => {
   }
 });
 
+const SUPPORT_SYSTEM_PROMPT_RU = 'Ты — дружелюбный ассистент поддержки сайта Room Factory. Room Factory — это сайт, где пользователь загружает фото своей комнаты, а ИИ создаёт варианты дизайна интерьера в выбранном стиле (скандинавский, минимализм, лофт, классика, japandi, бохо) за 30 секунд. ' +
+  'Пользователь может выбрать тип комнаты, цветовую гамму, бюджет ремонта, магазин мебели (Hoff, Askona, Divan.ru) — после генерации сайт показывает похожую мебель из этого каталога. Есть необязательные поля: форма и площадь комнаты, число окон — их можно указать вручную, чтобы результат точнее совпадал с реальной планировкой. ' +
+  'Есть личный кабинет с историей сгенерированных дизайнов, тест на определение стиля, и отдельный режим "3D-тур" — по размерам комнат строится 3D-модель квартиры, по которой можно пройтись. Сейчас все основные функции сайта бесплатны. ' +
+  'Отвечай кратко и дружелюбно, по-русски (если пользователь не написал на другом языке — тогда отвечай на его языке). Если вопрос не связан с сайтом Room Factory или ты не знаешь точного ответа — вежливо предложи написать на roomfactory_help@mail.ru. Не выдумывай факты о сервисе, которых нет в этом описании. Не давай юридических, налоговых или медицинских консультаций.';
+
+app.post('/support-chat', express.json(), async (req, res) => {
+  try {
+    const message = (req.body && req.body.message || '').toString().slice(0, 2000);
+    const history = Array.isArray(req.body && req.body.history) ? req.body.history.slice(-10) : [];
+    if (!message) { res.status(400).json({ error: 'no message' }); return; }
+
+    const token = await getAccessToken();
+    const messages = [
+      { role: 'system', content: SUPPORT_SYSTEM_PROMPT_RU },
+      ...history.filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string').map(m => ({ role: m.role, content: m.content.slice(0, 2000) })),
+      { role: 'user', content: message }
+    ];
+
+    const resp = await fetch(API_BASE + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'GigaChat-2-Max', messages })
+    });
+    const text = await resp.text();
+    if (!resp.ok) throw new Error('support-chat ' + resp.status + ': ' + text);
+    const data = JSON.parse(text);
+    const reply = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+    res.json({ reply });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 app.get('/', (req, res) => res.send('Room Factory GigaChat proxy is running'));
 
 const PORT = process.env.PORT || 3000;
