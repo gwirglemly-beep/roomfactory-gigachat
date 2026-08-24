@@ -124,34 +124,34 @@ async function describeGeneratedFurniture(token, fileId) {
   }
 }
 
-function findGeminiImageBlock(data) {
-  if (data.output_image && data.output_image.data) return data.output_image;
-  const steps = data.steps || [];
-  for (const step of steps) {
-    const content = step.content || [];
-    for (const block of content) {
-      if (block.type === 'image' && block.data) return block;
+function findGeminiImagePart(data) {
+  const candidates = data.candidates || [];
+  for (const c of candidates) {
+    const parts = (c.content && c.content.parts) || [];
+    for (const p of parts) {
+      if (p.inlineData && p.inlineData.data) return p.inlineData;
+      if (p.inline_data && p.inline_data.data) return p.inline_data;
     }
   }
   return null;
 }
 
 async function generateWithGemini(promptText, images) {
-  const input = [{ type: 'text', text: promptText }];
+  const parts = [{ text: promptText }];
   images.forEach(img => {
-    input.push({ type: 'image', mime_type: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') });
+    parts.push({ inline_data: { mime_type: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') } });
   });
-  const resp = await fetch(GEMINI_API_BASE + '/interactions', {
+  const resp = await fetch(GEMINI_API_BASE + '/models/' + GEMINI_MODEL + ':generateContent', {
     method: 'POST',
     headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: GEMINI_MODEL, input })
+    body: JSON.stringify({ contents: [{ parts }] })
   });
   const text = await resp.text();
   if (!resp.ok) throw new Error('gemini ' + resp.status + ': ' + text);
   const data = JSON.parse(text);
-  const block = findGeminiImageBlock(data);
-  if (!block) throw new Error('no image in gemini response: ' + text);
-  return { buffer: Buffer.from(block.data, 'base64'), mimeType: block.mime_type || 'image/jpeg' };
+  const part = findGeminiImagePart(data);
+  if (!part) throw new Error('no image in gemini response: ' + text);
+  return { buffer: Buffer.from(part.data, 'base64'), mimeType: part.mimeType || part.mime_type || 'image/jpeg' };
 }
 
 app.post('/generate', upload.single('image'), async (req, res) => {
