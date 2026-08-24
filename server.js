@@ -137,13 +137,14 @@ function findGeminiImagePart(data) {
 }
 
 async function generateWithGemini(promptText, images) {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set on the server');
   const parts = [{ text: promptText }];
   images.forEach(img => {
     parts.push({ inline_data: { mime_type: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') } });
   });
-  const resp = await fetch(GEMINI_API_BASE + '/models/' + GEMINI_MODEL + ':generateContent', {
+  const resp = await fetch(GEMINI_API_BASE + '/models/' + GEMINI_MODEL + ':generateContent?key=' + encodeURIComponent(GEMINI_API_KEY || ''), {
     method: 'POST',
-    headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ contents: [{ parts }] })
   });
   const text = await resp.text();
