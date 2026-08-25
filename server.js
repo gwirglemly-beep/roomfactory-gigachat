@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const crypto = require('crypto');
+const { GoogleGenAI } = require('@google/genai');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -19,8 +20,14 @@ const API_BASE = 'https://gigachat.devices.sberbank.ru/api/v1';
 const AUTH_KEY = process.env.GIGACHAT_AUTH_KEY;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const GEMINI_MODEL = 'gemini-2.5-flash-image';
+
+let geminiClient = null;
+function getGeminiClient() {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set on the server');
+  if (!geminiClient) geminiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+  return geminiClient;
+}
 
 let cachedToken = null;
 let tokenExpiresAt = 0;
@@ -124,35 +131,30 @@ async function describeGeneratedFurniture(token, fileId) {
   }
 }
 
-function findGeminiImagePart(data) {
-  const candidates = data.candidates || [];
+function findGeminiImagePart(response) {
+  const candidates = response.candidates || [];
   for (const c of candidates) {
     const parts = (c.content && c.content.parts) || [];
     for (const p of parts) {
       if (p.inlineData && p.inlineData.data) return p.inlineData;
-      if (p.inline_data && p.inline_data.data) return p.inline_data;
     }
   }
   return null;
 }
 
 async function generateWithGemini(promptText, images) {
-  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set on the server');
+  const client = getGeminiClient();
   const parts = [{ text: promptText }];
   images.forEach(img => {
-    parts.push({ inline_data: { mime_type: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') } });
+    parts.push({ inlineData: { mimeType: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') } });
   });
-  const resp = await fetch(GEMINI_API_BASE + '/models/' + GEMINI_MODEL + ':generateContent?key=' + encodeURIComponent(GEMINI_API_KEY || ''), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts }] })
+  const response = await client.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: [{ role: 'user', parts }]
   });
-  const text = await resp.text();
-  if (!resp.ok) throw new Error('gemini ' + resp.status + ': ' + text);
-  const data = JSON.parse(text);
-  const part = findGeminiImagePart(data);
-  if (!part) throw new Error('no image in gemini response: ' + text);
-  return { buffer: Buffer.from(part.data, 'base64'), mimeType: part.mimeType || part.mime_type || 'image/jpeg' };
+  const part = findGeminiImagePart(response);
+  if (!part) throw new Error('no image in gemini response: ' + JSON.stringify(response).slice(0, 800));
+  return { buffer: Buffer.from(part.data, 'base64'), mimeType: part.mimeType || 'image/jpeg' };
 }
 
 app.post('/generate', upload.single('image'), async (req, res) => {
