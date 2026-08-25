@@ -20,7 +20,7 @@ const AUTH_KEY = process.env.GIGACHAT_AUTH_KEY;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
-const GEMINI_MODEL = 'gemini-3.1-flash-lite-image';
+const GEMINI_MODEL = 'gemini-2.5-flash-image';
 
 let cachedToken = null;
 let tokenExpiresAt = 0;
