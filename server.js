@@ -20,7 +20,7 @@ const API_BASE = 'https://gigachat.devices.sberbank.ru/api/v1';
 const AUTH_KEY = process.env.GIGACHAT_AUTH_KEY;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-2.5-flash-image';
+const GEMINI_MODEL = 'gemini-3.1-flash-image';
 
 let geminiClient = null;
 function getGeminiClient() {
