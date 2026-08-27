@@ -142,19 +142,35 @@ function findGeminiImagePart(response) {
   return null;
 }
 
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
 async function generateWithGemini(promptText, images) {
   const client = getGeminiClient();
   const parts = [{ text: promptText }];
   images.forEach(img => {
     parts.push({ inlineData: { mimeType: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') } });
   });
-  const response = await client.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{ role: 'user', parts }]
-  });
-  const part = findGeminiImagePart(response);
-  if (!part) throw new Error('no image in gemini response: ' + JSON.stringify(response).slice(0, 800));
-  return { buffer: Buffer.from(part.data, 'base64'), mimeType: part.mimeType || 'image/jpeg' };
+
+  const maxAttempts = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await client.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: [{ role: 'user', parts }]
+      });
+      const part = findGeminiImagePart(response);
+      if (!part) throw new Error('no image in gemini response: ' + JSON.stringify(response).slice(0, 800));
+      return { buffer: Buffer.from(part.data, 'base64'), mimeType: part.mimeType || 'image/jpeg' };
+    } catch (err) {
+      lastErr = err;
+      const status = err && err.status;
+      const retryable = status === 503 || status === 429 || status === 500;
+      if (!retryable || attempt === maxAttempts) throw err;
+      await sleep(attempt * 2000);
+    }
+  }
+  throw lastErr;
 }
 
 async function fetchImageAsPart(url) {
