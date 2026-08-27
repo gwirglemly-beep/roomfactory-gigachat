@@ -176,12 +176,12 @@ app.post('/generate', upload.single('image'), async (req, res) => {
 
     let referenceUrls = [];
     try { referenceUrls = JSON.parse(req.body.referenceImageUrls || '[]'); } catch (e) {}
-    const referenceParts = (await Promise.all((Array.isArray(referenceUrls) ? referenceUrls : []).slice(0, 3).map(fetchImageAsPart))).filter(Boolean);
+    const referenceParts = (await Promise.all((Array.isArray(referenceUrls) ? referenceUrls : []).slice(0, 8).map(fetchImageAsPart))).filter(Boolean);
 
     const fullPrompt = [
       'Redesign this exact room photo: ' + prompt + '.',
       'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the original photo — only change the furniture, decor, materials and colors.',
-      referenceParts.length ? 'The additional reference photos show real furniture products that must appear in the redesigned room, matching their exact appearance (shape, material, color) as closely as possible.' : ''
+      referenceParts.length ? 'Each additional reference photo shows a real furniture or decor product (sofa, chair, bed, table, wardrobe, shelf, lamp, rug, etc.) that must appear in the redesigned room, placed appropriately for its type and matching its exact appearance (shape, material, color) as closely as possible. Every reference item should be included — do not skip any of them.' : ''
     ].filter(Boolean).join(' ');
 
     const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt, [{ buffer: req.file.buffer, mimetype: req.file.mimetype }, ...referenceParts]);
