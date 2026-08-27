@@ -67,7 +67,7 @@ async function uploadImage(token, buffer, filename, mimetype) {
   return data.id;
 }
 
-const CANONICAL_STYLE_KEYS = ['scandinavian', 'minimalism', 'loft', 'classic', 'japandi', 'boho', 'artdeco', 'provence', 'hightech', 'eco'];
+const CANONICAL_STYLE_KEYS = ['scandinavian', 'minimalism', 'loft', 'classic', 'japandi', 'boho'];
 
 async function classifyStyleKey(token, fileId) {
   try {
@@ -78,7 +78,7 @@ async function classifyStyleKey(token, fileId) {
         model: 'GigaChat-2-Max',
         messages: [{
           role: 'user',
-          content: 'Посмотри на интерьер комнаты на фото и выбери ОДНО ближайшее слово из списка, которое лучше всего описывает стиль: scandinavian, minimalism, loft, classic, japandi, boho, artdeco, provence, hightech, eco. Ответь только этим одним словом на английском, без пояснений.',
+          content: 'Посмотри на интерьер комнаты на фото и выбери ОДНО ближайшее слово из списка, которое лучше всего описывает стиль: scandinavian, minimalism, loft, classic, japandi, boho. Ответь только этим одним словом на английском, без пояснений.',
           attachments: [fileId]
         }]
       })
@@ -157,17 +157,34 @@ async function generateWithGemini(promptText, images) {
   return { buffer: Buffer.from(part.data, 'base64'), mimeType: part.mimeType || 'image/jpeg' };
 }
 
+async function fetchImageAsPart(url) {
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    const mimetype = resp.headers.get('content-type') || 'image/jpeg';
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    return { buffer, mimetype };
+  } catch (e) {
+    return null;
+  }
+}
+
 app.post('/generate', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) { res.status(400).json({ error: 'no image' }); return; }
     const prompt = req.body.prompt || '';
 
+    let referenceUrls = [];
+    try { referenceUrls = JSON.parse(req.body.referenceImageUrls || '[]'); } catch (e) {}
+    const referenceParts = (await Promise.all((Array.isArray(referenceUrls) ? referenceUrls : []).slice(0, 3).map(fetchImageAsPart))).filter(Boolean);
+
     const fullPrompt = [
       'Redesign this exact room photo: ' + prompt + '.',
-      'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the original photo — only change the furniture, decor, materials and colors.'
-    ].join(' ');
+      'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the original photo — only change the furniture, decor, materials and colors.',
+      referenceParts.length ? 'The additional reference photos show real furniture products that must appear in the redesigned room, matching their exact appearance (shape, material, color) as closely as possible.' : ''
+    ].filter(Boolean).join(' ');
 
-    const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt, [{ buffer: req.file.buffer, mimetype: req.file.mimetype }]);
+    const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt, [{ buffer: req.file.buffer, mimetype: req.file.mimetype }, ...referenceParts]);
 
     const token = await getAccessToken();
     const resultFileId = await uploadImage(token, resultBuffer, 'result.jpg', mimeType);
@@ -225,7 +242,7 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
   }
 });
 
-const SUPPORT_SYSTEM_PROMPT_RU = 'Ты — дружелюбный ассистент поддержки сайта Room Factory. Room Factory — это сайт, где пользователь загружает фото своей комнаты, а ИИ создаёт варианты дизайна интерьера в выбранном стиле (скандинавский, минимализм, лофт, классика, japandi, бохо, ар-деко, прованс, хай-тек, эко-стиль — всего 10 стилей) за 30 секунд. ' +
+const SUPPORT_SYSTEM_PROMPT_RU = 'Ты — дружелюбный ассистент поддержки сайта Room Factory. Room Factory — это сайт, где пользователь загружает фото своей комнаты, а ИИ создаёт варианты дизайна интерьера в выбранном стиле (скандинавский, минимализм, лофт, классика, japandi, бохо) за 30 секунд. ' +
   'Пользователь может выбрать тип комнаты, цветовую гамму, бюджет ремонта, магазин мебели (Hoff, Askona, Divan.ru) — после генерации сайт показывает похожую мебель из этого каталога. ' +
   'Есть тест на определение подходящего стиля (сравнение пар фото), и отдельный раздел «Стиль квартиры» (в боковом меню) — там можно загрузить фото комнаты для переделки плюс несколько фото других комнат квартиры, и ИИ подберёт дизайн, вписывающийся в общий стиль всей квартиры. ' +
   'Есть личный кабинет с историей сгенерированных дизайнов. Сейчас все основные функции сайта бесплатны. ' +
