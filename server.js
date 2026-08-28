@@ -151,7 +151,7 @@ async function generateWithGemini(promptText, images) {
     parts.push({ inlineData: { mimeType: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') } });
   });
 
-  const maxAttempts = 3;
+  const maxAttempts = 5;
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -167,7 +167,7 @@ async function generateWithGemini(promptText, images) {
       const status = err && err.status;
       const retryable = status === 503 || status === 429 || status === 500;
       if (!retryable || attempt === maxAttempts) throw err;
-      await sleep(attempt * 2000);
+      await sleep(attempt * 3000);
     }
   }
   throw lastErr;
@@ -196,7 +196,7 @@ app.post('/generate', upload.single('image'), async (req, res) => {
 
     const fullPrompt = [
       'Redesign this exact room photo: ' + prompt + '.',
-      'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the original photo — only change the furniture, decor, materials and colors.',
+      'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the original photo — only change the furniture, decor, materials and colors. Do not extend, widen or reveal any part of the room that is not visible in the original photo — if the photo shows only a corner or a partial view of the room, the result must show that exact same corner or partial view, with the exact same crop and framing, not a wider or different part of the room. Do not invent walls, windows, doors or floor area that are not already visible in the original photo.',
       referenceParts.length ? 'Each additional reference photo shows a real furniture or decor product (sofa, chair, bed, table, wardrobe, shelf, lamp, rug, etc.) from the Hoff catalog that must appear in the redesigned room, placed appropriately for its type and matching its exact appearance (shape, material, color) as closely as possible. Every reference item should be included — do not skip any of them. All the main furniture pieces (sofas, beds, wardrobes, tables, chairs, storage units) must come strictly from these reference photos — do not invent or substitute any other furniture. You may add small atmospheric details not shown in the references, such as wallpaper or wall paint, curtains, books, notebooks, plants, cushions or other small decor — but keep these secondary and never let them replace or compete with the main reference furniture. Never add unrelated objects that were not in the original room photo and are not furniture or plain decor — no appliances, no pet items, no electronics, nothing that was not requested. Choose the wall color or wallpaper, floor tone and any added decor so they harmonize with the color palette of the reference furniture — do not use a wall color that clashes with it. This is the most important part: the final image must look like a single real, professionally staged room, not a collage of separate product photos pasted together. Every piece of furniture must rest naturally and fully on the floor or be mounted the way that exact product is actually mounted in real life — never floating, never cut off, never overlapping another object incorrectly. Use one consistent light source, direction and color temperature for the whole scene, with matching shadows and reflections on every item, matching perspective and scale for every piece relative to the room and to each other, so the whole room reads as one coherent, cozy, believable photograph — not a set of furniture items placed next to each other.' : ''
     ].filter(Boolean).join(' ');
 
