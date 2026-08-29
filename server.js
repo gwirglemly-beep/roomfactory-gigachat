@@ -215,6 +215,19 @@ app.post('/generate', upload.single('image'), async (req, res) => {
   }
 });
 
+app.post('/classify-style', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) { res.status(400).json({ error: 'no image' }); return; }
+    const token = await getAccessToken();
+    const fileId = await uploadImage(token, req.file.buffer, 'target.jpg', req.file.mimetype);
+    const styleKey = await classifyStyleKey(token, fileId);
+    res.json({ styleKey });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'apartmentPhotos', maxCount: 7 }]), async (req, res) => {
   try {
     const targetFile = req.files && req.files.image && req.files.image[0];
@@ -226,30 +239,28 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
     const budgetPrompt = req.body.budgetPrompt || '';
     const comment = req.body.comment || '';
 
+    let referenceUrls = [];
+    try { referenceUrls = JSON.parse(req.body.referenceImageUrls || '[]'); } catch (e) {}
+    const referenceParts = (await Promise.all((Array.isArray(referenceUrls) ? referenceUrls : []).slice(0, 8).map(fetchImageAsPart))).filter(Boolean);
+
     const fullPrompt = [
       'The first image is a photo of a room that needs a new interior design: ' + (room || 'a room') + '.',
-      'The other images show different rooms of the same apartment. This is the most important instruction: redesign the first room to look like it belongs to the exact same home as those other rooms — reuse the same wall color or wallpaper, the same flooring, the same materials, the same furniture style and finish, and the same overall color palette that you see in those reference photos. Do not invent a different style, palette or mood — copy what is already established in the other rooms as closely and literally as possible, the way a single interior designer would keep one consistent home instead of mismatched rooms.',
+      'The next ' + styleFiles.length + ' image(s) show different rooms of the same apartment. Use them ONLY as a reference for the wall color or wallpaper, the flooring, the materials and the overall color palette of this home — reuse those exactly, do not invent a different palette or mood. Do NOT copy specific furniture pieces from these apartment photos.',
+      referenceParts.length ? 'The remaining ' + referenceParts.length + ' image(s) each show a real furniture or decor product from the Hoff catalog that must appear in the redesigned room, matching its exact appearance (shape, material, color) as closely as possible. Every one of these reference items should be included — do not skip any of them. All the main furniture pieces (sofas, beds, wardrobes, tables, chairs, storage units) must come strictly from these Hoff reference photos — do not invent or substitute any other furniture. You may add small atmospheric details not shown in the references, such as curtains, books, notebooks, plants, cushions or other small decor — but keep these secondary.' : '',
       'At a ' + (budgetPrompt || 'mid-range') + ' furniture budget.',
       comment,
       'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the first photo — only change the furniture, decor, materials and colors. Do not extend, widen or reveal any part of the room that is not visible in the original photo — if the photo shows only a corner or a partial view of the room, the result must show that exact same corner or partial view, with the exact same crop and framing, not a wider or different part of the room. Do not invent walls, windows, doors or floor area that are not already visible in the original photo.',
+      'The final image must look like a single real, professionally staged room, not a collage of separate product photos pasted together. Every piece of furniture must rest naturally and fully on the floor or be mounted the way that exact product is actually mounted in real life — never floating, never cut off. Use one consistent light source, direction and color temperature for the whole scene, with matching shadows, perspective and scale, so the room reads as one coherent, believable photograph.',
       'Professional interior photography, photorealistic.'
     ].filter(Boolean).join(' ');
 
     const images = [{ buffer: targetFile.buffer, mimetype: targetFile.mimetype }]
-      .concat(styleFiles.map(f => ({ buffer: f.buffer, mimetype: f.mimetype })));
+      .concat(styleFiles.map(f => ({ buffer: f.buffer, mimetype: f.mimetype })))
+      .concat(referenceParts);
 
     const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt, images);
 
-    const token = await getAccessToken();
-    const resultFileId = await uploadImage(token, resultBuffer, 'result.jpg', mimeType);
-    const [furnitureList, styleKey] = await Promise.all([
-      describeGeneratedFurniture(token, resultFileId),
-      classifyStyleKey(token, resultFileId)
-    ]);
-
     res.set('Content-Type', mimeType);
-    res.set('X-Furniture-List', encodeURIComponent(JSON.stringify(furnitureList)));
-    res.set('X-Style-Key', styleKey);
     res.send(resultBuffer);
   } catch (err) {
     console.error(err);
