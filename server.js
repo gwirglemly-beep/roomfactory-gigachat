@@ -223,16 +223,15 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
     if (!styleFiles.length) { res.status(400).json({ error: 'no apartment photos' }); return; }
 
     const room = req.body.room || '';
-    const color = req.body.color || '';
     const budgetPrompt = req.body.budgetPrompt || '';
     const comment = req.body.comment || '';
 
     const fullPrompt = [
       'The first image is a photo of a room that needs a new interior design: ' + (room || 'a room') + '.',
-      'The other images show different rooms of the same apartment — use them only as a reference for the overall interior style, materials and color mood already present in this home.',
-      'Redesign the first room to match that same style, using colors: ' + (color || 'a coordinated palette') + ', at a ' + (budgetPrompt || 'mid-range') + ' furniture budget.',
+      'The other images show different rooms of the same apartment. This is the most important instruction: redesign the first room to look like it belongs to the exact same home as those other rooms — reuse the same wall color or wallpaper, the same flooring, the same materials, the same furniture style and finish, and the same overall color palette that you see in those reference photos. Do not invent a different style, palette or mood — copy what is already established in the other rooms as closely and literally as possible, the way a single interior designer would keep one consistent home instead of mismatched rooms.',
+      'At a ' + (budgetPrompt || 'mid-range') + ' furniture budget.',
       comment,
-      'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the first photo — only change the furniture, decor, materials and colors.',
+      'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the first photo — only change the furniture, decor, materials and colors. Do not extend, widen or reveal any part of the room that is not visible in the original photo — if the photo shows only a corner or a partial view of the room, the result must show that exact same corner or partial view, with the exact same crop and framing, not a wider or different part of the room. Do not invent walls, windows, doors or floor area that are not already visible in the original photo.',
       'Professional interior photography, photorealistic.'
     ].filter(Boolean).join(' ');
 
