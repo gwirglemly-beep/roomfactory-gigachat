@@ -210,9 +210,22 @@ async function generateWithGemini(promptText, images) {
   throw lastErr;
 }
 
-async function fetchImageAsPart(url) {
+const ALLOWED_IMAGE_HOSTS = ['hoff.ru', 'www.hoff.ru'];
+
+function isAllowedImageUrl(url) {
   try {
-    const resp = await fetch(url);
+    const u = new URL(url);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    return ALLOWED_IMAGE_HOSTS.includes(u.hostname.toLowerCase());
+  } catch (e) {
+    return false;
+  }
+}
+
+async function fetchImageAsPart(url) {
+  if (!isAllowedImageUrl(url)) return null;
+  try {
+    const resp = await fetch(url, { redirect: 'error' });
     if (!resp.ok) return null;
     const mimetype = resp.headers.get('content-type') || 'image/jpeg';
     const buffer = Buffer.from(await resp.arrayBuffer());
