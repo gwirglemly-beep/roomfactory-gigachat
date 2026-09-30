@@ -398,8 +398,12 @@ let dbSsl = { rejectUnauthorized: false };
 })();
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+  host: process.env.PGHOST,
+  port: process.env.PGPORT ? parseInt(process.env.PGPORT, 10) : 5432,
+  user: process.env.PGUSER,
+  password: process.env.PGPASSWORD,
+  database: process.env.PGDATABASE,
+  ssl: process.env.PGHOST ? { rejectUnauthorized: false } : false
 });
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
