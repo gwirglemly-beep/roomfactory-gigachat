@@ -413,7 +413,8 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.mail.ru';
-const SMTP_PORT = parseInt(process.env.SMTP_PORT || '465', 10);
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
+const SMTP_SECURE = SMTP_PORT === 465;
 
 let mailTransportPromise = null;
 function getMailTransport() {
@@ -425,7 +426,9 @@ function getMailTransport() {
         resolve(nodemailer.createTransport({
           host,
           port: SMTP_PORT,
-          secure: true,
+          secure: SMTP_SECURE,
+          requireTLS: !SMTP_SECURE,
+          connectionTimeout: 15000,
           tls: { servername: SMTP_HOST },
           auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
         }));
