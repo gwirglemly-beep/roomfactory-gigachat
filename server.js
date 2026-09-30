@@ -1,10 +1,13 @@
 const express = require('express');
 const multer = require('multer');
 const crypto = require('crypto');
+const dns = require('dns');
 const { GoogleGenAI } = require('@google/genai');
 const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
 const { Pool } = require('pg');
+
+dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 app.set('trust proxy', true);
