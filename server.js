@@ -413,6 +413,7 @@ const mailTransport = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.mail.ru',
   port: parseInt(process.env.SMTP_PORT || '465', 10),
   secure: true,
+  family: 4,
   auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
 });
 
