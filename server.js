@@ -2,6 +2,9 @@ const express = require('express');
 const multer = require('multer');
 const crypto = require('crypto');
 const { GoogleGenAI } = require('@google/genai');
+const bcrypt = require('bcryptjs');
+const nodemailer = require('nodemailer');
+const { Pool } = require('pg');
 
 const app = express();
 app.set('trust proxy', true);
@@ -9,8 +12,8 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Expose-Headers', 'X-Furniture-List, X-Style-Key');
   if (req.method === 'OPTIONS') { res.sendStatus(200); return; }
   next();
@@ -376,6 +379,366 @@ app.post('/support-chat', express.json(), async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// ===================================================================
+// Своя авторизация (замена Supabase Auth) + история (замена Supabase DB)
+// ===================================================================
+
+let dbSsl = { rejectUnauthorized: false };
+(async () => {
+  try {
+    const resp = await fetch('https://st.timeweb.com/cloud-static/ca.crt');
+    if (resp.ok) {
+      const ca = await resp.text();
+      if (ca.includes('BEGIN CERTIFICATE')) dbSsl = { ca, rejectUnauthorized: true };
+    }
+  } catch (e) { console.error('Не удалось скачать сертификат Timeweb, используем менее строгий SSL:', e.message); }
+})();
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const mailTransport = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.mail.ru',
+  port: parseInt(process.env.SMTP_PORT || '465', 10),
+  secure: true,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+});
+
+async function sendMail(to, subject, text) {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    console.error('SMTP не настроен, письмо не отправлено:', to, subject);
+    return;
+  }
+  await mailTransport.sendMail({
+    from: '"Room Factory" <' + process.env.SMTP_USER + '>',
+    to,
+    subject,
+    text
+  });
+}
+
+function isValidEmail(email) {
+  return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 200;
+}
+
+function generateCode() {
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+async function createSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 дней
+  await pool.query(
+    'INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, $3)',
+    [hashToken(token), userId, expiresAt]
+  );
+  return token;
+}
+
+async function requireAuth(req, res, next) {
+  try {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) { res.status(401).json({ error: 'not_authenticated' }); return; }
+    const { rows } = await pool.query(
+      'SELECT s.user_id, u.email FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = $1 AND s.expires_at > now()',
+      [hashToken(token)]
+    );
+    if (!rows.length) { res.status(401).json({ error: 'not_authenticated' }); return; }
+    req.user = { id: rows[0].user_id, email: rows[0].email };
+    next();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+}
+
+app.post('/auth/register', express.json(), async (req, res) => {
+  try {
+    const email = (req.body.email || '').trim().toLowerCase();
+    const password = req.body.password || '';
+    if (!isValidEmail(email)) { res.status(400).json({ error: 'invalid_email' }); return; }
+    if (password.length < 8) { res.status(400).json({ error: 'weak_password' }); return; }
+
+    const existing = await pool.query('SELECT id, email_verified FROM users WHERE email = $1', [email]);
+    if (existing.rows.length) { res.status(409).json({ error: 'email_taken' }); return; }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const inserted = await pool.query(
+      'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id',
+      [email, passwordHash]
+    );
+    const userId = inserted.rows[0].id;
+
+    const code = generateCode();
+    await pool.query(
+      'INSERT INTO email_verification_codes (user_id, code, expires_at) VALUES ($1, $2, now() + interval \'15 minutes\')',
+      [userId, code]
+    );
+    await sendMail(email, 'Код подтверждения Room Factory', 'Ваш код подтверждения: ' + code + '\n\nОн действует 15 минут.');
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/auth/verify-email', express.json(), async (req, res) => {
+  try {
+    const email = (req.body.email || '').trim().toLowerCase();
+    const code = (req.body.code || '').trim();
+    const user = await pool.query('SELECT id, email_verified FROM users WHERE email = $1', [email]);
+    if (!user.rows.length) { res.status(400).json({ error: 'invalid_code' }); return; }
+    const userId = user.rows[0].id;
+
+    const match = await pool.query(
+      'SELECT id FROM email_verification_codes WHERE user_id = $1 AND code = $2 AND used = FALSE AND expires_at > now() ORDER BY created_at DESC LIMIT 1',
+      [userId, code]
+    );
+    if (!match.rows.length) { res.status(400).json({ error: 'invalid_code' }); return; }
+
+    await pool.query('UPDATE email_verification_codes SET used = TRUE WHERE id = $1', [match.rows[0].id]);
+    await pool.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [userId]);
+
+    const token = await createSession(userId);
+    res.json({ token, user: { id: userId, email, first_name: null, last_name: null, phone: null, preferred_style: null } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/auth/resend-code', express.json(), async (req, res) => {
+  try {
+    const email = (req.body.email || '').trim().toLowerCase();
+    const user = await pool.query('SELECT id, email_verified FROM users WHERE email = $1', [email]);
+    if (user.rows.length && !user.rows[0].email_verified) {
+      const code = generateCode();
+      await pool.query(
+        'INSERT INTO email_verification_codes (user_id, code, expires_at) VALUES ($1, $2, now() + interval \'15 minutes\')',
+        [user.rows[0].id, code]
+      );
+      await sendMail(email, 'Код подтверждения Room Factory', 'Ваш код подтверждения: ' + code + '\n\nОн действует 15 минут.');
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/auth/login', express.json(), async (req, res) => {
+  try {
+    const email = (req.body.email || '').trim().toLowerCase();
+    const password = req.body.password || '';
+    const user = await pool.query('SELECT id, password_hash, email_verified, first_name, last_name, phone, preferred_style FROM users WHERE email = $1', [email]);
+    if (!user.rows.length) { res.status(401).json({ error: 'invalid_credentials' }); return; }
+
+    const ok = await bcrypt.compare(password, user.rows[0].password_hash);
+    if (!ok) { res.status(401).json({ error: 'invalid_credentials' }); return; }
+    if (!user.rows[0].email_verified) { res.status(403).json({ error: 'email_not_verified' }); return; }
+
+    const token = await createSession(user.rows[0].id);
+    res.json({ token, user: {
+      id: user.rows[0].id,
+      email,
+      first_name: user.rows[0].first_name,
+      last_name: user.rows[0].last_name,
+      phone: user.rows[0].phone,
+      preferred_style: user.rows[0].preferred_style
+    } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/auth/logout', requireAuth, express.json(), async (req, res) => {
+  try {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (token) await pool.query('DELETE FROM sessions WHERE token_hash = $1', [hashToken(token)]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/auth/me', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, email, first_name, last_name, phone, preferred_style FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    if (!rows.length) { res.status(401).json({ error: 'not_authenticated' }); return; }
+    res.json({ user: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.patch('/auth/me', requireAuth, express.json(), async (req, res) => {
+  try {
+    const firstName = typeof req.body.first_name === 'string' ? req.body.first_name.slice(0, 100) : undefined;
+    const lastName = typeof req.body.last_name === 'string' ? req.body.last_name.slice(0, 100) : undefined;
+    const phone = typeof req.body.phone === 'string' ? req.body.phone.slice(0, 30) : undefined;
+    const preferredStyle = typeof req.body.preferred_style === 'string' ? req.body.preferred_style.slice(0, 50) : undefined;
+
+    const { rows } = await pool.query(
+      `UPDATE users SET
+         first_name = COALESCE($1, first_name),
+         last_name = COALESCE($2, last_name),
+         phone = COALESCE($3, phone),
+         preferred_style = COALESCE($4, preferred_style)
+       WHERE id = $5
+       RETURNING id, email, first_name, last_name, phone, preferred_style`,
+      [firstName, lastName, phone, preferredStyle, req.user.id]
+    );
+    res.json({ user: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/auth/request-password-reset', express.json(), async (req, res) => {
+  try {
+    const email = (req.body.email || '').trim().toLowerCase();
+    const user = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (user.rows.length) {
+      const code = generateCode();
+      await pool.query(
+        'INSERT INTO password_reset_codes (user_id, code, expires_at) VALUES ($1, $2, now() + interval \'15 minutes\')',
+        [user.rows[0].id, code]
+      );
+      await sendMail(email, 'Восстановление пароля Room Factory', 'Код для сброса пароля: ' + code + '\n\nОн действует 15 минут. Если это были не вы — просто проигнорируйте письмо.');
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/auth/reset-password', express.json(), async (req, res) => {
+  try {
+    const email = (req.body.email || '').trim().toLowerCase();
+    const code = (req.body.code || '').trim();
+    const newPassword = req.body.newPassword || '';
+    if (newPassword.length < 8) { res.status(400).json({ error: 'weak_password' }); return; }
+
+    const user = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (!user.rows.length) { res.status(400).json({ error: 'invalid_code' }); return; }
+    const userId = user.rows[0].id;
+
+    const match = await pool.query(
+      'SELECT id FROM password_reset_codes WHERE user_id = $1 AND code = $2 AND used = FALSE AND expires_at > now() ORDER BY created_at DESC LIMIT 1',
+      [userId, code]
+    );
+    if (!match.rows.length) { res.status(400).json({ error: 'invalid_code' }); return; }
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE password_reset_codes SET used = TRUE WHERE id = $1', [match.rows[0].id]);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, userId]);
+    await pool.query('DELETE FROM sessions WHERE user_id = $1', [userId]); // разлогиниваем везде из соображений безопасности
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// ===================================================================
+// История генераций
+// ===================================================================
+
+async function uploadToSupabaseStorage(userId, buffer, mimetype) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) throw new Error('Supabase Storage не настроен на сервере');
+  const ext = mimetype === 'image/png' ? 'png' : 'jpg';
+  const path = userId + '/' + Date.now() + '.' + ext;
+  const resp = await fetch(SUPABASE_URL + '/storage/v1/object/designs/' + path, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY,
+      'apikey': SUPABASE_SERVICE_ROLE_KEY,
+      'Content-Type': mimetype || 'image/jpeg'
+    },
+    body: buffer
+  });
+  if (!resp.ok) throw new Error('storage upload ' + resp.status + ': ' + (await resp.text()));
+  return SUPABASE_URL + '/storage/v1/object/public/designs/' + path;
+}
+
+app.get('/generations', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, image_url, style_key, style_label, room_label, store_label, created_at FROM generations WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json({ generations: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/generations', requireAuth, upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) { res.status(400).json({ error: 'no image' }); return; }
+    const imageUrl = await uploadToSupabaseStorage(req.user.id, req.file.buffer, req.file.mimetype);
+    const { rows } = await pool.query(
+      'INSERT INTO generations (user_id, image_url, style_key, style_label, room_label, store_label) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, image_url, style_key, style_label, room_label, store_label, created_at',
+      [req.user.id, imageUrl, req.body.styleKey || null, req.body.styleLabel || null, req.body.roomLabel || null, req.body.storeLabel || null]
+    );
+    res.json({ generation: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.delete('/generations/:id', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'DELETE FROM generations WHERE id = $1 AND user_id = $2 RETURNING image_url',
+      [req.params.id, req.user.id]
+    );
+    if (!rows.length) { res.status(404).json({ error: 'not_found' }); return; }
+
+    if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+      try {
+        const marker = '/designs/';
+        const idx = rows[0].image_url.indexOf(marker);
+        if (idx !== -1) {
+          const path = rows[0].image_url.slice(idx + marker.length);
+          await fetch(SUPABASE_URL + '/storage/v1/object/designs/' + path, {
+            method: 'DELETE',
+            headers: { 'Authorization': 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY, 'apikey': SUPABASE_SERVICE_ROLE_KEY }
+          });
+        }
+      } catch (e2) { console.error('Не удалось удалить файл из хранилища:', e2); }
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
