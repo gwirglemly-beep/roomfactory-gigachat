@@ -412,20 +412,36 @@ const pool = new Pool({
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const mailTransport = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.mail.ru',
-  port: parseInt(process.env.SMTP_PORT || '465', 10),
-  secure: true,
-  family: 4,
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-});
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.mail.ru';
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '465', 10);
+
+let mailTransportPromise = null;
+function getMailTransport() {
+  if (!mailTransportPromise) {
+    mailTransportPromise = new Promise((resolve) => {
+      dns.resolve4(SMTP_HOST, (err, addresses) => {
+        const host = (!err && addresses && addresses.length) ? addresses[0] : SMTP_HOST;
+        if (err) console.error('Не удалось получить IPv4-адрес SMTP, используем имя хоста напрямую:', err.message);
+        resolve(nodemailer.createTransport({
+          host,
+          port: SMTP_PORT,
+          secure: true,
+          tls: { servername: SMTP_HOST },
+          auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+        }));
+      });
+    });
+  }
+  return mailTransportPromise;
+}
 
 async function sendMail(to, subject, text) {
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
     console.error('SMTP не настроен, письмо не отправлено:', to, subject);
     return;
   }
-  await mailTransport.sendMail({
+  const transport = await getMailTransport();
+  await transport.sendMail({
     from: '"Room Factory" <' + process.env.SMTP_USER + '>',
     to,
     subject,
