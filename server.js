@@ -4,7 +4,6 @@ const crypto = require('crypto');
 const dns = require('dns');
 const { GoogleGenAI } = require('@google/genai');
 const bcrypt = require('bcryptjs');
-const nodemailer = require('nodemailer');
 const { Pool } = require('pg');
 
 dns.setDefaultResultOrder('ipv4first');
@@ -412,48 +411,46 @@ const pool = new Pool({
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const SMTP_HOST = process.env.SMTP_HOST || 'smtp.mail.ru';
-const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
-const SMTP_SECURE = SMTP_PORT === 465;
-
-let mailTransportPromise = null;
-function getMailTransport() {
-  if (!mailTransportPromise) {
-    mailTransportPromise = new Promise((resolve) => {
-      dns.resolve4(SMTP_HOST, (err, addresses) => {
-        const host = (!err && addresses && addresses.length) ? addresses[0] : SMTP_HOST;
-        if (err) console.error('Не удалось получить IPv4-адрес SMTP, используем имя хоста напрямую:', err.message);
-        resolve(nodemailer.createTransport({
-          host,
-          port: SMTP_PORT,
-          secure: SMTP_SECURE,
-          requireTLS: !SMTP_SECURE,
-          connectionTimeout: 15000,
-          tls: { servername: SMTP_HOST },
-          auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-        }));
-      });
-    });
-  }
-  return mailTransportPromise;
-}
+const UNISENDER_API_KEY = process.env.UNISENDER_API_KEY;
+const UNISENDER_SENDER_EMAIL = process.env.UNISENDER_SENDER_EMAIL;
 
 async function sendMail(to, subject, text) {
-  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    console.error('SMTP не настроен, письмо не отправлено:', to, subject);
+  if (!UNISENDER_API_KEY || !UNISENDER_SENDER_EMAIL) {
+    console.error('Почтовый сервис не настроен, письмо не отправлено:', to, subject);
     return;
   }
-  const transport = await getMailTransport();
-  await transport.sendMail({
-    from: '"Room Factory" <' + process.env.SMTP_USER + '>',
-    to,
+  const params = new URLSearchParams({
+    format: 'json',
+    api_key: UNISENDER_API_KEY,
+    email: to,
+    sender_name: 'Room Factory',
+    sender_email: UNISENDER_SENDER_EMAIL,
     subject,
-    text
+    body: text.replace(/\n/g, '<br>')
   });
+  const resp = await fetch('https://api.unisender.com/ru/api/sendEmail', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  });
+  const data = await resp.json();
+  if (!resp.ok || data.error) {
+    throw new Error('Unisender API: ' + (data.error || resp.status));
+  }
 }
 
 function isValidEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 200;
+}
+
+function hasMailServer(email) {
+  return new Promise((resolve) => {
+    const domain = email.split('@')[1];
+    if (!domain) { resolve(false); return; }
+    dns.resolveMx(domain, (err, addresses) => {
+      resolve(!err && addresses && addresses.length > 0);
+    });
+  });
 }
 
 function generateCode() {
@@ -498,6 +495,7 @@ app.post('/auth/register', express.json(), async (req, res) => {
     const password = req.body.password || '';
     if (!isValidEmail(email)) { res.status(400).json({ error: 'invalid_email' }); return; }
     if (password.length < 8) { res.status(400).json({ error: 'weak_password' }); return; }
+    if (!(await hasMailServer(email))) { res.status(400).json({ error: 'invalid_email' }); return; }
 
     const existing = await pool.query('SELECT id, email_verified FROM users WHERE email = $1', [email]);
     if (existing.rows.length) { res.status(409).json({ error: 'email_taken' }); return; }
