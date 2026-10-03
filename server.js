@@ -353,7 +353,7 @@ const SUPPORT_SYSTEM_PROMPT_RU = 'Ты — дружелюбный ассисте
   'Пользователь может выбрать тип комнаты, цветовую гамму, бюджет ремонта, магазин мебели (Hoff, Askona, Divan.ru) — после генерации сайт показывает похожую мебель из этого каталога. ' +
   'Есть тест на определение подходящего стиля (сравнение пар фото), и отдельный раздел «Стиль квартиры» (в боковом меню) — там можно загрузить фото комнаты для переделки плюс несколько фото других комнат квартиры, и ИИ подберёт дизайн, вписывающийся в общий стиль всей квартиры. ' +
   'Есть личный кабинет с историей сгенерированных дизайнов. Сейчас все основные функции сайта бесплатны. ' +
-  'Отвечай кратко и дружелюбно, по-русски (если пользователь не написал на другом языке — тогда отвечай на его языке). Если вопрос не связан с сайтом Room Factory или ты не знаешь точного ответа — вежливо предложи написать на room-factory_help@mail.ru. Не выдумывай факты о сервисе, которых нет в этом описании. Не давай юридических, налоговых или медицинских консультаций.';
+  'Отвечай кратко и дружелюбно, по-русски (если пользователь не написал на другом языке — тогда отвечай на его языке). Если вопрос не связан с сайтом Room Factory или ты не знаешь точного ответа — вежливо предложи написать на help@room-factory.ru. Не выдумывай факты о сервисе, которых нет в этом описании. Не давай юридических, налоговых или медицинских консультаций.';
 
 app.post('/support-chat', express.json(), async (req, res) => {
   try {
@@ -413,6 +413,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const UNISENDER_API_KEY = process.env.UNISENDER_API_KEY;
 const UNISENDER_SENDER_EMAIL = process.env.UNISENDER_SENDER_EMAIL;
+const REQUIRE_EMAIL_VERIFICATION = process.env.REQUIRE_EMAIL_VERIFICATION === 'true';
 
 async function sendMail(to, subject, text) {
   if (!UNISENDER_API_KEY || !UNISENDER_SENDER_EMAIL) {
@@ -502,10 +503,16 @@ app.post('/auth/register', express.json(), async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
     const inserted = await pool.query(
-      'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id',
-      [email, passwordHash]
+      'INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, $3) RETURNING id',
+      [email, passwordHash, !REQUIRE_EMAIL_VERIFICATION]
     );
     const userId = inserted.rows[0].id;
+
+    if (!REQUIRE_EMAIL_VERIFICATION) {
+      const token = await createSession(userId);
+      res.json({ token, user: { id: userId, email, first_name: null, last_name: null, phone: null, preferred_style: null } });
+      return;
+    }
 
     const code = generateCode();
     await pool.query(
@@ -574,7 +581,7 @@ app.post('/auth/login', express.json(), async (req, res) => {
 
     const ok = await bcrypt.compare(password, user.rows[0].password_hash);
     if (!ok) { res.status(401).json({ error: 'invalid_credentials' }); return; }
-    if (!user.rows[0].email_verified) { res.status(403).json({ error: 'email_not_verified' }); return; }
+    if (REQUIRE_EMAIL_VERIFICATION && !user.rows[0].email_verified) { res.status(403).json({ error: 'email_not_verified' }); return; }
 
     const token = await createSession(user.rows[0].id);
     res.json({ token, user: {
