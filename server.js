@@ -16,7 +16,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Expose-Headers', 'X-Furniture-List, X-Style-Key');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Furniture-List, X-Style-Key, X-Matched-Items');
   if (req.method === 'OPTIONS') { res.sendStatus(200); return; }
   next();
 });
@@ -276,6 +276,52 @@ async function fetchImageAsPart(url) {
   }
 }
 
+// Проверка: какие из товаров-образцов действительно видны на готовой картинке.
+// Если проверка не удалась (ошибка, нет подходящей модели) — возвращаем null, и сайт показывает все выбранные товары, как раньше.
+const VERIFY_MODELS = [process.env.GEMINI_VERIFY_MODEL, 'gemini-2.5-flash', GEMINI_MODEL].filter(Boolean);
+
+function geminiResponseText(response) {
+  const candidates = response.candidates || [];
+  let out = '';
+  for (const c of candidates) {
+    const parts = (c.content && c.content.parts) || [];
+    for (const p of parts) if (typeof p.text === 'string') out += p.text;
+  }
+  return out;
+}
+
+async function matchReferencesInResult(resultImage, referenceParts) {
+  if (!referenceParts.length) return null;
+  const client = getGeminiClient();
+  const parts = [{ text: 'The first image is a photo of a designed room. After it come ' + referenceParts.length + ' numbered product photos from a furniture catalog.' }];
+  parts.push({ inlineData: { mimeType: resultImage.mimetype || 'image/jpeg', data: resultImage.buffer.toString('base64') } });
+  referenceParts.forEach((img, i) => {
+    parts.push({ text: 'Product ' + (i + 1) + ':' });
+    parts.push({ inlineData: { mimeType: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') } });
+  });
+  parts.push({ text: 'Which of the numbered products clearly appear in the designed room photo? A product counts only if an item of the same type, with the same color and a very similar shape and design, is visible in the room. If the type matches but the color or design is clearly different, it does NOT count. Answer with ONLY a JSON array of the product numbers, for example [1,3]. If none appear, answer [].' });
+  for (const model of VERIFY_MODELS) {
+    try {
+      const response = await client.models.generateContent({ model, contents: [{ role: 'user', parts }] });
+      const m = geminiResponseText(response).match(/\[[\d,\s]*\]/);
+      if (m) {
+        return JSON.parse(m[0]).filter(n => Number.isInteger(n) && n >= 1 && n <= referenceParts.length).map(n => n - 1);
+      }
+    } catch (e) {
+      console.error('verify failed with model ' + model + ':', e && e.message);
+    }
+  }
+  return null;
+}
+
+async function fetchReferenceParts(referenceUrls, limit) {
+  const urls = (Array.isArray(referenceUrls) ? referenceUrls : []).slice(0, limit);
+  const results = await Promise.all(urls.map(fetchImageAsPart));
+  const parts = results.filter(Boolean);
+  const origIndex = results.map((p, i) => (p ? i : -1)).filter(i => i >= 0);
+  return { parts, origIndex };
+}
+
 const USER_REFERENCE_RULES = 'Follow the user\'s instruction about this photo precisely: if they say they want exactly this item (for example "точно такой", "именно этот", "exactly this one"), reproduce it faithfully — same shape, same color, same material. If they ask for something similar, place a similar item of the same type and style instead. If their instruction says to change only this one item and keep everything else, do exactly that: modify only what this photo and instruction describe, and leave every other piece of furniture and decor in the room exactly as it is in the original room photo, unchanged.';
 
 app.post('/generate', upload.single('image'), async (req, res) => {
@@ -289,7 +335,7 @@ app.post('/generate', upload.single('image'), async (req, res) => {
 
     let referenceUrls = [];
     try { referenceUrls = JSON.parse(req.body.referenceImageUrls || '[]'); } catch (e) {}
-    const referenceParts = (await Promise.all((Array.isArray(referenceUrls) ? referenceUrls : []).slice(0, 8).map(fetchImageAsPart))).filter(Boolean);
+    const { parts: referenceParts, origIndex: refOrigIndex } = await fetchReferenceParts(referenceUrls, 8);
     const userRef = parseUserReference(req.body.userReferenceImage);
 
     const fullPrompt = [
@@ -308,6 +354,9 @@ app.post('/generate', upload.single('image'), async (req, res) => {
       .concat(referenceParts);
 
     const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt, images);
+
+    const matched = await matchReferencesInResult({ buffer: resultBuffer, mimetype: mimeType }, referenceParts);
+    if (matched) res.set('X-Matched-Items', matched.map(i => refOrigIndex[i]).join(','));
 
     const token = await getAccessToken();
     const resultFileId = await uploadImage(token, resultBuffer, 'result.jpg', mimeType);
@@ -352,7 +401,7 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
 
     let referenceUrls = [];
     try { referenceUrls = JSON.parse(req.body.referenceImageUrls || '[]'); } catch (e) {}
-    const referenceParts = (await Promise.all((Array.isArray(referenceUrls) ? referenceUrls : []).slice(0, 6).map(fetchImageAsPart))).filter(Boolean);
+    const { parts: referenceParts, origIndex: refOrigIndex } = await fetchReferenceParts(referenceUrls, 6);
     const userRef = parseUserReference(req.body.userReferenceImage);
 
     const fullPrompt = [
@@ -375,6 +424,9 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
       .concat(referenceParts);
 
     const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt, images);
+
+    const matched = await matchReferencesInResult({ buffer: resultBuffer, mimetype: mimeType }, referenceParts);
+    if (matched) res.set('X-Matched-Items', matched.map(i => refOrigIndex[i]).join(','));
 
     res.set('Content-Type', mimeType);
     res.send(resultBuffer);
