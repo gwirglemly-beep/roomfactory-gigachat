@@ -28,8 +28,13 @@ const AUTH_KEY = process.env.GIGACHAT_AUTH_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = 'gemini-3.1-flash-image';
 
-const DAILY_LIMIT_PER_IP = parseInt(process.env.DAILY_LIMIT_PER_IP || '3', 10);
+// Лимит бесплатных генераций: GEN_LIMIT_TOTAL за всё время на аккаунт (счётчик в БД, users.generations_used).
+// Для гостей без входа — тот же лимит на IP (в памяти сервера, сбрасывается при перезапуске).
+// DAILY_LIMIT_GLOBAL — только защита бюджета: общий потолок генераций в сутки.
+const GEN_LIMIT_TOTAL = parseInt(process.env.GEN_LIMIT_TOTAL || '3', 10);
 const DAILY_LIMIT_GLOBAL = parseInt(process.env.DAILY_LIMIT_GLOBAL || '300', 10);
+// UNLIMITED_EMAILS — почты через запятую (в Render), у которых нет лимита на аккаунт (владелец, тестирование).
+const UNLIMITED_EMAILS = (process.env.UNLIMITED_EMAILS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 let usageDay = '';
 let usageGlobal = 0;
 const usageByIp = new Map();
@@ -38,22 +43,53 @@ function moscowDay() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Moscow' });
 }
 
-function reserveGeneration(req, res) {
-  const day = moscowDay();
-  if (day !== usageDay) { usageDay = day; usageByIp.clear(); usageGlobal = 0; }
-  const ip = req.ip || 'unknown';
-  if (usageGlobal >= DAILY_LIMIT_GLOBAL) { res.status(429).json({ error: 'global_limit' }); return null; }
-  const used = usageByIp.get(ip) || 0;
-  if (used >= DAILY_LIMIT_PER_IP) { res.status(429).json({ error: 'daily_limit' }); return null; }
-  usageByIp.set(ip, used + 1);
-  usageGlobal++;
-  return ip;
+async function getOptionalUser(req) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return null;
+  const { rows } = await pool.query(
+    'SELECT s.user_id, u.email FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = $1 AND s.expires_at > now()',
+    [hashToken(token)]
+  );
+  return rows.length ? { id: rows[0].user_id, email: rows[0].email } : null;
 }
 
-function releaseGeneration(ip) {
-  if (!ip) return;
+async function reserveGeneration(req, res) {
+  const day = moscowDay();
+  if (day !== usageDay) { usageDay = day; usageGlobal = 0; }
+  if (usageGlobal >= DAILY_LIMIT_GLOBAL) { res.status(429).json({ error: 'global_limit' }); return null; }
+
+  const user = await getOptionalUser(req);
+  if (user) {
+    if (UNLIMITED_EMAILS.includes(String(user.email || '').toLowerCase())) { usageGlobal++; return { unlimited: true }; }
+    const userId = user.id;
+    const { rows } = await pool.query(
+      'UPDATE users SET generations_used = generations_used + 1 WHERE id = $1 AND generations_used < $2 RETURNING generations_used',
+      [userId, GEN_LIMIT_TOTAL]
+    );
+    if (!rows.length) { res.status(429).json({ error: 'limit_reached' }); return null; }
+    usageGlobal++;
+    return { userId };
+  }
+
+  const ip = req.ip || 'unknown';
   const used = usageByIp.get(ip) || 0;
-  if (used > 0) usageByIp.set(ip, used - 1);
+  if (used >= GEN_LIMIT_TOTAL) { res.status(429).json({ error: 'limit_reached' }); return null; }
+  usageByIp.set(ip, used + 1);
+  usageGlobal++;
+  return { ip };
+}
+
+async function releaseGeneration(reserved) {
+  if (!reserved) return;
+  try {
+    if (reserved.userId) {
+      await pool.query('UPDATE users SET generations_used = GREATEST(generations_used - 1, 0) WHERE id = $1', [reserved.userId]);
+    } else if (reserved.ip) {
+      const used = usageByIp.get(reserved.ip) || 0;
+      if (used > 0) usageByIp.set(reserved.ip, used - 1);
+    }
+  } catch (e) { console.error(e); }
   if (usageGlobal > 0) usageGlobal--;
 }
 
@@ -243,11 +279,11 @@ async function fetchImageAsPart(url) {
 const USER_REFERENCE_RULES = 'Follow the user\'s instruction about this photo precisely: if they say they want exactly this item (for example "точно такой", "именно этот", "exactly this one"), reproduce it faithfully — same shape, same color, same material. If they ask for something similar, place a similar item of the same type and style instead. If their instruction says to change only this one item and keep everything else, do exactly that: modify only what this photo and instruction describe, and leave every other piece of furniture and decor in the room exactly as it is in the original room photo, unchanged.';
 
 app.post('/generate', upload.single('image'), async (req, res) => {
-  let reservedIp = null;
+  let reserved = null;
   try {
     if (!req.file) { res.status(400).json({ error: 'no image' }); return; }
-    reservedIp = reserveGeneration(req, res);
-    if (!reservedIp) return;
+    reserved = await reserveGeneration(req, res);
+    if (!reserved) return;
     const styleGuidance = req.body.prompt || '';
     const userComment = (req.body.comment || '').trim();
 
@@ -281,7 +317,7 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     res.set('X-Furniture-List', encodeURIComponent(JSON.stringify(furnitureList)));
     res.send(resultBuffer);
   } catch (err) {
-    releaseGeneration(reservedIp);
+    await releaseGeneration(reserved);
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });
   }
@@ -301,14 +337,14 @@ app.post('/classify-style', upload.single('image'), async (req, res) => {
 });
 
 app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'apartmentPhotos', maxCount: 7 }]), async (req, res) => {
-  let reservedIp = null;
+  let reserved = null;
   try {
     const targetFile = req.files && req.files.image && req.files.image[0];
     const styleFiles = (req.files && req.files.apartmentPhotos) || [];
     if (!targetFile) { res.status(400).json({ error: 'no image' }); return; }
     if (!styleFiles.length) { res.status(400).json({ error: 'no apartment photos' }); return; }
-    reservedIp = reserveGeneration(req, res);
-    if (!reservedIp) return;
+    reserved = await reserveGeneration(req, res);
+    if (!reserved) return;
 
     const room = req.body.room || '';
     const budgetPrompt = req.body.budgetPrompt || '';
@@ -343,7 +379,7 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
     res.set('Content-Type', mimeType);
     res.send(resultBuffer);
   } catch (err) {
-    releaseGeneration(reservedIp);
+    await releaseGeneration(reserved);
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });
   }
