@@ -314,6 +314,63 @@ async function matchReferencesInResult(resultImage, referenceParts) {
   return null;
 }
 
+// Подсказка про способ установки: потолочные светильники вешаем на потолок, настенные вещи — на стену, а не ставим на пол.
+function mountHint(name) {
+  const n = String(name || '').toLowerCase();
+  if (/люстр|потолоч|подвесн|накладн/.test(n)) return ' (ceiling-mounted: it MUST hang from the ceiling, never stand on the floor or furniture)';
+  if (/(^|\s)бра(\s|$)|настенн|навесн|вешалк|полка/.test(n)) return ' (wall-mounted: it MUST be fixed on the wall)';
+  if (/торшер|напольн/.test(n)) return ' (floor lamp: stands on the floor)';
+  if (/зеркал/.test(n)) return ' (mirror: hang it on the wall or lean it against the wall)';
+  return '';
+}
+
+// Проверка готовой картинки: какие товары из подборки на ней видны и нет ли явного брака (люстра на полу, предметы в воздухе).
+// Если брак найден, генерация один раз повторяется с указанием, что исправить.
+async function inspectResult(resultImage, referenceParts) {
+  const client = getGeminiClient();
+  const parts = [{ text: 'The first image is a photo of a designed room.' + (referenceParts.length ? ' After it come ' + referenceParts.length + ' numbered product photos from a furniture catalog.' : '') }];
+  parts.push({ inlineData: { mimeType: resultImage.mimetype || 'image/jpeg', data: resultImage.buffer.toString('base64') } });
+  referenceParts.forEach((img, i) => {
+    parts.push({ text: 'Product ' + (i + 1) + ':' });
+    parts.push({ inlineData: { mimeType: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') } });
+  });
+  parts.push({ text: 'Task 1: which of the numbered products appear in the designed room photo? A product counts if an item of the same type and a similar color is visible; the exact design may differ slightly. If there are no products, use an empty list. ' +
+    'Task 2: does the room photo contain a clear physical or realism defect, for example a ceiling light, chandelier or pendant lamp standing on the floor or on furniture, furniture floating in the air, a wall-mounted item lying on the floor, or a clearly deformed object? ' +
+    'Answer with ONLY a JSON object like {"products":[1,3],"defect":null}. Put a short English sentence in "defect" only for a clear defect, otherwise null.' });
+  for (const model of VERIFY_MODELS) {
+    try {
+      const response = await client.models.generateContent({ model, contents: [{ role: 'user', parts }] });
+      const text = geminiResponseText(response);
+      const m = text.match(/\{[\s\S]*\}/);
+      if (m) {
+        const obj = JSON.parse(m[0]);
+        const list = Array.isArray(obj.products) ? obj.products.filter(n => Number.isInteger(n) && n >= 1 && n <= referenceParts.length).map(n => n - 1) : null;
+        const defect = typeof obj.defect === 'string' && obj.defect.trim() ? obj.defect.trim().slice(0, 200) : null;
+        return { matched: referenceParts.length ? list : null, defect };
+      }
+    } catch (e) {
+      console.error('inspect failed with model ' + model + ':', e && e.message);
+    }
+  }
+  return null;
+}
+
+async function generateChecked(promptText, images, referenceParts) {
+  let gen = await generateWithGemini(promptText, images);
+  let info = await inspectResult({ buffer: gen.buffer, mimetype: gen.mimeType }, referenceParts);
+  if (info && info.defect) {
+    console.log('defect found, regenerating once:', info.defect);
+    try {
+      const retry = await generateWithGemini(promptText + ' IMPORTANT: the previous attempt had this defect, fix it this time: ' + info.defect + '. Ceiling lights always hang from the ceiling, all furniture stands naturally on the floor.', images);
+      const info2 = await inspectResult({ buffer: retry.buffer, mimetype: retry.mimeType }, referenceParts);
+      gen = retry; info = info2;
+    } catch (e) {
+      console.error('regeneration failed, keeping first result:', e && e.message);
+    }
+  }
+  return { buffer: gen.buffer, mimeType: gen.mimeType, matched: info ? info.matched : null };
+}
+
 async function fetchReferenceParts(referenceUrls, limit) {
   const urls = (Array.isArray(referenceUrls) ? referenceUrls : []).slice(0, limit);
   const results = await Promise.all(urls.map(fetchImageAsPart));
@@ -338,7 +395,7 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     const { parts: referenceParts, origIndex: refOrigIndex } = await fetchReferenceParts(referenceUrls, 8);
     let refNames = [];
     try { refNames = JSON.parse(req.body.referenceNames || '[]'); } catch (e) {}
-    const refNamesText = referenceParts.length ? 'The last ' + referenceParts.length + ' reference photos, in order, are these catalog products: ' + refOrigIndex.map((o, i) => (i + 1) + ') ' + String(refNames[o] || 'product').slice(0, 120)).join('; ') + '. Reproduce each of them as shown.' : '';
+    const refNamesText = referenceParts.length ? 'The last ' + referenceParts.length + ' reference photos, in order, are these catalog products: ' + refOrigIndex.map((o, i) => (i + 1) + ') ' + String(refNames[o] || 'product').slice(0, 120) + mountHint(refNames[o])).join('; ') + '. Reproduce each of them as shown. Ceiling lights, chandeliers and pendant lamps always hang from the ceiling; wall-mounted items are always on the wall; never place them on the floor.' : '';
     const userRef = parseUserReference(req.body.userReferenceImage);
 
     const fullPrompt = [
@@ -356,9 +413,7 @@ app.post('/generate', upload.single('image'), async (req, res) => {
       .concat(userRef ? [userRef] : [])
       .concat(referenceParts);
 
-    const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt + ' ' + refNamesText, images);
-
-    const matched = await matchReferencesInResult({ buffer: resultBuffer, mimetype: mimeType }, referenceParts);
+    const { buffer: resultBuffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + refNamesText, images, referenceParts);
     if (matched) res.set('X-Matched-Items', matched.map(i => refOrigIndex[i]).join(','));
 
     const token = await getAccessToken();
@@ -407,7 +462,7 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
     const { parts: referenceParts, origIndex: refOrigIndex } = await fetchReferenceParts(referenceUrls, 6);
     let refNames = [];
     try { refNames = JSON.parse(req.body.referenceNames || '[]'); } catch (e) {}
-    const refNamesText = referenceParts.length ? 'The last ' + referenceParts.length + ' reference photos, in order, are these catalog products: ' + refOrigIndex.map((o, i) => (i + 1) + ') ' + String(refNames[o] || 'product').slice(0, 120)).join('; ') + '. Reproduce each of them as shown.' : '';
+    const refNamesText = referenceParts.length ? 'The last ' + referenceParts.length + ' reference photos, in order, are these catalog products: ' + refOrigIndex.map((o, i) => (i + 1) + ') ' + String(refNames[o] || 'product').slice(0, 120) + mountHint(refNames[o])).join('; ') + '. Reproduce each of them as shown. Ceiling lights, chandeliers and pendant lamps always hang from the ceiling; wall-mounted items are always on the wall; never place them on the floor.' : '';
     const userRef = parseUserReference(req.body.userReferenceImage);
 
     const fullPrompt = [
@@ -429,9 +484,7 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
       .concat(userRef ? [userRef] : [])
       .concat(referenceParts);
 
-    const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt + ' ' + refNamesText, images);
-
-    const matched = await matchReferencesInResult({ buffer: resultBuffer, mimetype: mimeType }, referenceParts);
+    const { buffer: resultBuffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + refNamesText, images, referenceParts);
     if (matched) res.set('X-Matched-Items', matched.map(i => refOrigIndex[i]).join(','));
 
     res.set('Content-Type', mimeType);
