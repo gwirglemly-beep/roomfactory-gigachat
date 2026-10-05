@@ -299,7 +299,7 @@ async function matchReferencesInResult(resultImage, referenceParts) {
     parts.push({ text: 'Product ' + (i + 1) + ':' });
     parts.push({ inlineData: { mimeType: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') } });
   });
-  parts.push({ text: 'Which of the numbered products clearly appear in the designed room photo? A product counts only if an item of the same type, with the same color and a very similar shape and design, is visible in the room. If the type matches but the color or design is clearly different, it does NOT count. Answer with ONLY a JSON array of the product numbers, for example [1,3]. If none appear, answer [].' });
+  parts.push({ text: 'Which of the numbered products clearly appear in the designed room photo? A product counts if an item of the same type and a similar color is visible in the room; the exact design may differ slightly. If the type is missing from the room or the color is clearly different, it does NOT count. Answer with ONLY a JSON array of the product numbers, for example [1,3]. If none appear, answer [].' });
   for (const model of VERIFY_MODELS) {
     try {
       const response = await client.models.generateContent({ model, contents: [{ role: 'user', parts }] });
@@ -336,6 +336,9 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     let referenceUrls = [];
     try { referenceUrls = JSON.parse(req.body.referenceImageUrls || '[]'); } catch (e) {}
     const { parts: referenceParts, origIndex: refOrigIndex } = await fetchReferenceParts(referenceUrls, 8);
+    let refNames = [];
+    try { refNames = JSON.parse(req.body.referenceNames || '[]'); } catch (e) {}
+    const refNamesText = referenceParts.length ? 'The last ' + referenceParts.length + ' reference photos, in order, are these catalog products: ' + refOrigIndex.map((o, i) => (i + 1) + ') ' + String(refNames[o] || 'product').slice(0, 120)).join('; ') + '. Reproduce each of them as shown.' : '';
     const userRef = parseUserReference(req.body.userReferenceImage);
 
     const fullPrompt = [
@@ -353,7 +356,7 @@ app.post('/generate', upload.single('image'), async (req, res) => {
       .concat(userRef ? [userRef] : [])
       .concat(referenceParts);
 
-    const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt, images);
+    const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt + ' ' + refNamesText, images);
 
     const matched = await matchReferencesInResult({ buffer: resultBuffer, mimetype: mimeType }, referenceParts);
     if (matched) res.set('X-Matched-Items', matched.map(i => refOrigIndex[i]).join(','));
@@ -402,6 +405,9 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
     let referenceUrls = [];
     try { referenceUrls = JSON.parse(req.body.referenceImageUrls || '[]'); } catch (e) {}
     const { parts: referenceParts, origIndex: refOrigIndex } = await fetchReferenceParts(referenceUrls, 6);
+    let refNames = [];
+    try { refNames = JSON.parse(req.body.referenceNames || '[]'); } catch (e) {}
+    const refNamesText = referenceParts.length ? 'The last ' + referenceParts.length + ' reference photos, in order, are these catalog products: ' + refOrigIndex.map((o, i) => (i + 1) + ') ' + String(refNames[o] || 'product').slice(0, 120)).join('; ') + '. Reproduce each of them as shown.' : '';
     const userRef = parseUserReference(req.body.userReferenceImage);
 
     const fullPrompt = [
@@ -423,7 +429,7 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
       .concat(userRef ? [userRef] : [])
       .concat(referenceParts);
 
-    const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt, images);
+    const { buffer: resultBuffer, mimeType } = await generateWithGemini(fullPrompt + ' ' + refNamesText, images);
 
     const matched = await matchReferencesInResult({ buffer: resultBuffer, mimetype: mimeType }, referenceParts);
     if (matched) res.set('X-Matched-Items', matched.map(i => refOrigIndex[i]).join(','));
