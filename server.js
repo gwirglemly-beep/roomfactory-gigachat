@@ -278,7 +278,15 @@ async function fetchImageAsPart(url) {
 
 // Проверка: какие из товаров-образцов действительно видны на готовой картинке.
 // Если проверка не удалась (ошибка, нет подходящей модели) — возвращаем null, и сайт показывает все выбранные товары, как раньше.
-const VERIFY_MODELS = [process.env.GEMINI_VERIFY_MODEL, 'gemini-2.5-flash', GEMINI_MODEL].filter(Boolean);
+// Текстовые модели Gemini для проверки картинок. gemini-2.5-flash больше недоступна новым пользователям (ответ API 404), поэтому первой идёт gemini-3.8-flash.
+// Свою модель можно задать переменной GEMINI_VERIFY_MODEL в Render. Модель, которая вернула 404, больше не пробуется, рабочая запоминается.
+const VERIFY_MODELS = [process.env.GEMINI_VERIFY_MODEL, 'gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-2.5-flash', GEMINI_MODEL].filter(Boolean);
+const badVerifyModels = new Set();
+let goodVerifyModel = null;
+function verifyModelOrder() {
+  const list = VERIFY_MODELS.filter(m => !badVerifyModels.has(m));
+  return goodVerifyModel && list.includes(goodVerifyModel) ? [goodVerifyModel].concat(list.filter(m => m !== goodVerifyModel)) : list;
+}
 
 function geminiResponseText(response) {
   const candidates = response.candidates || [];
@@ -338,7 +346,7 @@ async function inspectResult(resultImage, referenceParts, palette) {
     'Task 2: does the room photo contain a clear physical or realism defect, for example a ceiling light, chandelier or pendant lamp standing on the floor or on furniture, furniture floating in the air, a wall-mounted item lying on the floor, or a clearly deformed object? ' +
     (palette ? 'Task 3: the requested color palette is: ' + palette + '. Does the room clearly violate this palette, for example saturated green, red or blue furniture or decor in a monochrome palette? If yes, treat it as a defect and name the offending items and colors. ' : '') +
     'Answer with ONLY a JSON object like {"products":[1,3],"defect":null}. Put a short English sentence in "defect" only for a clear defect or palette violation, otherwise null.' });
-  for (const model of VERIFY_MODELS) {
+  for (const model of verifyModelOrder()) {
     try {
       const response = await client.models.generateContent({ model, contents: [{ role: 'user', parts }] });
       const text = geminiResponseText(response);
@@ -347,10 +355,12 @@ async function inspectResult(resultImage, referenceParts, palette) {
         const obj = JSON.parse(m[0]);
         const list = Array.isArray(obj.products) ? obj.products.filter(n => Number.isInteger(n) && n >= 1 && n <= referenceParts.length).map(n => n - 1) : null;
         const defect = typeof obj.defect === 'string' && obj.defect.trim() ? obj.defect.trim().slice(0, 200) : null;
+        goodVerifyModel = model;
         return { matched: referenceParts.length ? list : null, defect };
       }
     } catch (e) {
       console.error('inspect failed with model ' + model + ':', e && e.message);
+      if (e && (e.status === 404 || /NOT_FOUND|no longer available/i.test(String(e.message || '')))) badVerifyModels.add(model);
     }
   }
   return null;
