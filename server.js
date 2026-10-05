@@ -326,7 +326,7 @@ function mountHint(name) {
 
 // Проверка готовой картинки: какие товары из подборки на ней видны и нет ли явного брака (люстра на полу, предметы в воздухе).
 // Если брак найден, генерация один раз повторяется с указанием, что исправить.
-async function inspectResult(resultImage, referenceParts) {
+async function inspectResult(resultImage, referenceParts, palette) {
   const client = getGeminiClient();
   const parts = [{ text: 'The first image is a photo of a designed room.' + (referenceParts.length ? ' After it come ' + referenceParts.length + ' numbered product photos from a furniture catalog.' : '') }];
   parts.push({ inlineData: { mimeType: resultImage.mimetype || 'image/jpeg', data: resultImage.buffer.toString('base64') } });
@@ -336,7 +336,8 @@ async function inspectResult(resultImage, referenceParts) {
   });
   parts.push({ text: 'Task 1: which of the numbered products appear in the designed room photo? A product counts if an item of the same type and a similar color is visible; the exact design may differ slightly. If there are no products, use an empty list. ' +
     'Task 2: does the room photo contain a clear physical or realism defect, for example a ceiling light, chandelier or pendant lamp standing on the floor or on furniture, furniture floating in the air, a wall-mounted item lying on the floor, or a clearly deformed object? ' +
-    'Answer with ONLY a JSON object like {"products":[1,3],"defect":null}. Put a short English sentence in "defect" only for a clear defect, otherwise null.' });
+    (palette ? 'Task 3: the requested color palette is: ' + palette + '. Does the room clearly violate this palette, for example saturated green, red or blue furniture or decor in a monochrome palette? If yes, treat it as a defect and name the offending items and colors. ' : '') +
+    'Answer with ONLY a JSON object like {"products":[1,3],"defect":null}. Put a short English sentence in "defect" only for a clear defect or palette violation, otherwise null.' });
   for (const model of VERIFY_MODELS) {
     try {
       const response = await client.models.generateContent({ model, contents: [{ role: 'user', parts }] });
@@ -355,14 +356,14 @@ async function inspectResult(resultImage, referenceParts) {
   return null;
 }
 
-async function generateChecked(promptText, images, referenceParts) {
+async function generateChecked(promptText, images, referenceParts, palette) {
   let gen = await generateWithGemini(promptText, images);
-  let info = await inspectResult({ buffer: gen.buffer, mimetype: gen.mimeType }, referenceParts);
+  let info = await inspectResult({ buffer: gen.buffer, mimetype: gen.mimeType }, referenceParts, palette);
   if (info && info.defect) {
     console.log('defect found, regenerating once:', info.defect);
     try {
       const retry = await generateWithGemini(promptText + ' IMPORTANT: the previous attempt had this defect, fix it this time: ' + info.defect + '. Ceiling lights always hang from the ceiling, all furniture stands naturally on the floor.', images);
-      const info2 = await inspectResult({ buffer: retry.buffer, mimetype: retry.mimeType }, referenceParts);
+      const info2 = await inspectResult({ buffer: retry.buffer, mimetype: retry.mimeType }, referenceParts, palette);
       gen = retry; info = info2;
     } catch (e) {
       console.error('regeneration failed, keeping first result:', e && e.message);
@@ -405,7 +406,7 @@ app.post('/generate', upload.single('image'), async (req, res) => {
       userRef ? 'An additional reference photo was supplied by the user, showing the exact item related to their request above. ' + USER_REFERENCE_RULES : '',
       referenceParts.length ? (userComment
         ? 'The last ' + referenceParts.length + ' reference photo(s) show real furniture or decor products from the Hoff catalog, matching the overall style. Use them only to style or furnish parts of the room that the user\'s request above does not already cover or ask to keep — never use them to replace or remove anything the user asked to keep unchanged.'
-        : 'Each of the last ' + referenceParts.length + ' reference photo(s) shows a real furniture or decor product (sofa, chair, bed, table, wardrobe, shelf, lamp, rug, etc.) from the Hoff catalog that must appear in the redesigned room, placed appropriately for its type and matching its exact appearance (shape, material, color) as closely as possible. Every reference item should be included — do not skip any of them. All the main furniture pieces (sofas, beds, wardrobes, tables, chairs, storage units) must come strictly from these reference photos — do not invent or substitute any other furniture. You may add small atmospheric details not shown in the references, such as wallpaper or wall paint, curtains, books, notebooks, plants, cushions or other small decor — but keep these secondary and never let them replace or compete with the main reference furniture. Never add unrelated objects that were not in the original room photo and are not furniture or plain decor — no appliances, no pet items, no electronics, nothing that was not requested. Choose the wall color or wallpaper, floor tone and any added decor so they harmonize with the color palette of the reference furniture — do not use a wall color that clashes with it. The requested color palette applies only to the walls, curtains, textiles and small decor — never recolor, restyle or replace the reference furniture products themselves: every reference product keeps its exact original color, shape and material.') : '',
+        : 'Each of the last ' + referenceParts.length + ' reference photo(s) shows a real furniture or decor product (sofa, chair, bed, table, wardrobe, shelf, lamp, rug, etc.) from the Hoff catalog that must appear in the redesigned room, placed appropriately for its type and matching its exact appearance (shape, material, color) as closely as possible. Every reference item should be included — do not skip any of them. All the main furniture pieces (sofas, beds, wardrobes, tables, chairs, storage units) must come strictly from these reference photos — do not invent or substitute any other furniture. You may add small atmospheric details not shown in the references, such as wallpaper or wall paint, curtains, books, notebooks, plants, cushions or other small decor — but keep these secondary and never let them replace or compete with the main reference furniture. Never add unrelated objects that were not in the original room photo and are not furniture or plain decor — no appliances, no pet items, no electronics, nothing that was not requested. Choose the wall color or wallpaper, floor tone and any added decor so they harmonize with the color palette of the reference furniture — do not use a wall color that clashes with it. The requested color palette is MANDATORY for the whole room: walls, floor accents, textiles, decor AND furniture. Keep the shape and design of each reference product, but if its color clearly clashes with the requested palette, recolor that item to a matching palette color. Strictly avoid any saturated color that is not part of the palette.') : '',
       'This is the most important part regardless of the above: the final image must look like a single real, professionally staged room, not a collage of separate product photos pasted together. Every piece of furniture must rest naturally and fully on the floor or be mounted the way that exact product is actually mounted in real life — never floating, never cut off, never overlapping another object incorrectly. Use one consistent light source, direction and color temperature for the whole scene, with matching shadows and reflections on every item, matching perspective and scale for every piece relative to the room and to each other, so the whole room reads as one coherent, cozy, believable photograph — not a set of furniture items placed next to each other.'
     ].filter(Boolean).join(' ');
 
@@ -413,7 +414,7 @@ app.post('/generate', upload.single('image'), async (req, res) => {
       .concat(userRef ? [userRef] : [])
       .concat(referenceParts);
 
-    const { buffer: resultBuffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + refNamesText, images, referenceParts);
+    const { buffer: resultBuffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + refNamesText, images, referenceParts, String(req.body.palette || '').slice(0, 200));
     if (matched) res.set('X-Matched-Items', matched.map(i => refOrigIndex[i]).join(','));
 
     const token = await getAccessToken();
@@ -469,7 +470,7 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
       'The first image is a photo of a room that needs a new interior design: ' + (room || 'a room') + '.',
       referenceParts.length ? (userComment
         ? 'The last ' + referenceParts.length + ' image(s) in this request each show one specific real furniture or decor product from the Hoff catalog, matching the overall style. Use them for parts of the room that the user\'s request below does not already cover or ask to keep.'
-        : 'This is the single most important instruction, follow it exactly: the last ' + referenceParts.length + ' image(s) in this request each show one specific real furniture or decor product from the Hoff catalog. Every main furniture piece in the redesigned room (every sofa, bed, wardrobe, table, chair, storage unit) MUST be exactly that product — same silhouette, same exact color, same exact material and finish as shown in its reference photo, not a similar or reinterpreted version and not a different color. Do not substitute any of them with a different-colored or different-shaped piece. Include every one of these reference items somewhere in the room — do not skip any of them. The requested color palette applies only to the walls, curtains, textiles and small decor — never recolor, restyle or replace the reference furniture products themselves: every reference product keeps its exact original color, shape and material.') : '',
+        : 'This is the single most important instruction, follow it exactly: the last ' + referenceParts.length + ' image(s) in this request each show one specific real furniture or decor product from the Hoff catalog. Every main furniture piece in the redesigned room (every sofa, bed, wardrobe, table, chair, storage unit) MUST be exactly that product — same silhouette, same exact color, same exact material and finish as shown in its reference photo, not a similar or reinterpreted version and not a different color. Do not substitute any of them with a different-colored or different-shaped piece. Include every one of these reference items somewhere in the room — do not skip any of them. The requested color palette is MANDATORY for the whole room: walls, floor accents, textiles, decor AND furniture. Keep the shape and design of each reference product, but if its color clearly clashes with the requested palette, recolor that item to a matching palette color. Strictly avoid any saturated color that is not part of the palette.') : '',
       'The next ' + styleFiles.length + ' image(s) (before the Hoff product photos) show different rooms of the same apartment. Use them ONLY for the wall color or wallpaper, the flooring, the materials and the overall color palette of this home — reuse those exactly. Do NOT copy specific furniture pieces from these apartment photos, and do not let their mood override the exact furniture from the Hoff reference photos.',
       userRef ? 'One more image, placed right after the apartment photos and before the Hoff product photos, is a reference photo of a furniture or decor item supplied by the user, related to their request below. ' + USER_REFERENCE_RULES : '',
       userComment ? 'THE MOST IMPORTANT INSTRUCTION, follow it exactly and let it override anything above or below that conflicts with it: the user wrote this specific request: "' + userComment + '". If this request names or implies specific furniture or changes to keep, make, or avoid, follow it precisely. Anything in the room that this request does not mention should stay as close to the original room photo as possible, even while restyling — do not remove or replace furniture the user did not ask to change.' : '',
