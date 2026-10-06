@@ -16,7 +16,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Expose-Headers', 'X-Furniture-List, X-Style-Key, X-Matched-Items');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Furniture-List, X-Style-Key, X-Matched-Items, X-Used-Items');
   if (req.method === 'OPTIONS') { res.sendStatus(200); return; }
   next();
 });
@@ -343,7 +343,7 @@ async function inspectResult(resultImage, referenceParts, palette) {
     parts.push({ inlineData: { mimeType: img.mimetype || 'image/jpeg', data: img.buffer.toString('base64') } });
   });
   parts.push({ text: 'Task 1: which of the numbered products appear in the designed room photo? A product counts if an item of the same type and a similar color is visible; the exact design may differ slightly. If there are no products, use an empty list. ' +
-    'Task 2: does the room photo contain a clear physical or realism defect, for example a ceiling light, chandelier or pendant lamp standing on the floor or on furniture, furniture floating in the air, a wall-mounted item lying on the floor, or a clearly deformed object? ' +
+    'Task 2: does the room photo contain a clear physical or realism defect' + (referenceParts.length ? ', including any numbered product that is clearly missing from the room' : '') + ', for example a ceiling light, chandelier or pendant lamp standing on the floor or on furniture, furniture floating in the air, a wall-mounted item lying on the floor, or a clearly deformed object' + (referenceParts.length ? ', or any piece of furniture or lamp that is NOT one of the numbered products (for example an extra wardrobe, shelf, table, bed or chandelier)' : '') + '? ' +
     (palette ? 'Task 3: the requested color palette is: ' + palette + '. Does the room clearly violate this palette, for example saturated green, red or blue furniture or decor in a monochrome palette? If yes, treat it as a defect and name the offending items and colors. ' : '') +
     'Answer with ONLY a JSON object like {"products":[1,3],"defect":null}. Put a short English sentence in "defect" only for a clear defect or palette violation, otherwise null.' });
   for (const model of verifyModelOrder()) {
@@ -382,6 +382,18 @@ async function generateChecked(promptText, images, referenceParts, palette) {
   return { buffer: gen.buffer, mimeType: gen.mimeType, matched: info ? info.matched : null };
 }
 
+// Жёсткие правила для запроса к ИИ: мебель только из присланных фото каталога, ничего придуманного, гамма обязательна.
+function buildStrictRules(refCount, palette) {
+  if (!refCount) return '';
+  return 'ABSOLUTE FURNITURE RULE, it overrides every other instruction except the user\'s own written request: the ONLY furniture and lamps allowed in the final room are exactly the ' + refCount + ' catalog products shown in the last ' + refCount + ' reference photos. ' +
+    'Reproduce every one of them faithfully and place them naturally in the room. ' +
+    'Do NOT invent, imagine, add, copy or substitute ANY other furniture or lighting: no extra or built-in wardrobes or closets, no additional sofas, beds, armchairs, tables, desks, chairs, nightstands, dressers, shelves, shelving units, TV stands, lamps or chandeliers. ' +
+    'Remove all furniture that is in the original room photo (including wardrobes, shelves and lamps), unless the user\'s own written request says to keep it. ' +
+    'If the room would need an item that is not among the reference products, leave that place empty. ' +
+    'You may add only non-furniture decor: wall paint or wallpaper, curtains, plants, pictures, books, cushions and blankets, and a rug only if a rug is among the reference products.' +
+    (palette ? ' MANDATORY color palette for the whole room (walls, textiles, decor and furniture): ' + palette + '. Do not use colors outside this palette.' : '');
+}
+
 async function fetchReferenceParts(referenceUrls, limit) {
   const urls = (Array.isArray(referenceUrls) ? referenceUrls : []).slice(0, limit);
   const results = await Promise.all(urls.map(fetchImageAsPart));
@@ -406,13 +418,14 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     const { parts: referenceParts, origIndex: refOrigIndex } = await fetchReferenceParts(referenceUrls, 8);
     let refNames = [];
     try { refNames = JSON.parse(req.body.referenceNames || '[]'); } catch (e) {}
+    const palette = String(req.body.palette || '').slice(0, 200);
     const refNamesText = referenceParts.length ? 'The last ' + referenceParts.length + ' reference photos, in order, are these catalog products: ' + refOrigIndex.map((o, i) => (i + 1) + ') ' + String(refNames[o] || 'product').slice(0, 120) + mountHint(refNames[o])).join('; ') + '. Reproduce each of them as shown. Ceiling lights, chandeliers and pendant lamps always hang from the ceiling; wall-mounted items are always on the wall; never place them on the floor.' : '';
     const userRef = parseUserReference(req.body.userReferenceImage);
 
     const fullPrompt = [
       'Redesign this exact room photo, using this style guidance as the general direction: ' + styleGuidance + '.',
       'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the original photo — only change the furniture, decor, materials and colors. Do not extend, widen or reveal any part of the room that is not visible in the original photo — if the photo shows only a corner or a partial view of the room, the result must show that exact same corner or partial view, with the exact same crop and framing, not a wider or different part of the room. Do not invent walls, windows, doors or floor area that are not already visible in the original photo.',
-      userComment ? 'THE MOST IMPORTANT INSTRUCTION, follow it exactly and let it override anything below that conflicts with it: the user wrote this specific request: "' + userComment + '". If this request names or implies specific furniture or changes to keep, make, or avoid, follow it precisely. Anything in the room that this request does not mention should stay as close to the original room photo as possible, even while restyling — do not remove or replace furniture the user did not ask to change.' : '',
+      userComment ? 'THE MOST IMPORTANT INSTRUCTION, follow it exactly and let it override anything below that conflicts with it: the user wrote this specific request: "' + userComment + '". If this request names or implies specific furniture or changes to keep, make, or avoid, follow it precisely. Only the items that this request explicitly asks to keep stay as they are in the original room photo. Every other piece of furniture from the original photo is removed and replaced by the catalog products from the reference photos.' : '',
       userRef ? 'An additional reference photo was supplied by the user, showing the exact item related to their request above. ' + USER_REFERENCE_RULES : '',
       referenceParts.length ? (userComment
         ? 'The last ' + referenceParts.length + ' reference photo(s) show real furniture or decor products from the Hoff catalog, matching the overall style. Use them only to style or furnish parts of the room that the user\'s request above does not already cover or ask to keep — never use them to replace or remove anything the user asked to keep unchanged.'
@@ -424,8 +437,9 @@ app.post('/generate', upload.single('image'), async (req, res) => {
       .concat(userRef ? [userRef] : [])
       .concat(referenceParts);
 
-    const { buffer: resultBuffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + refNamesText, images, referenceParts, String(req.body.palette || '').slice(0, 200));
+    const { buffer: resultBuffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + buildStrictRules(referenceParts.length, palette) + ' ' + refNamesText, images, referenceParts, palette);
     if (matched) res.set('X-Matched-Items', matched.map(i => refOrigIndex[i]).join(','));
+    res.set('X-Used-Items', refOrigIndex.join(','));
 
     const token = await getAccessToken();
     const resultFileId = await uploadImage(token, resultBuffer, 'result.jpg', mimeType);
@@ -473,6 +487,7 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
     const { parts: referenceParts, origIndex: refOrigIndex } = await fetchReferenceParts(referenceUrls, 6);
     let refNames = [];
     try { refNames = JSON.parse(req.body.referenceNames || '[]'); } catch (e) {}
+    const palette = '';
     const refNamesText = referenceParts.length ? 'The last ' + referenceParts.length + ' reference photos, in order, are these catalog products: ' + refOrigIndex.map((o, i) => (i + 1) + ') ' + String(refNames[o] || 'product').slice(0, 120) + mountHint(refNames[o])).join('; ') + '. Reproduce each of them as shown. Ceiling lights, chandeliers and pendant lamps always hang from the ceiling; wall-mounted items are always on the wall; never place them on the floor.' : '';
     const userRef = parseUserReference(req.body.userReferenceImage);
 
@@ -483,7 +498,7 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
         : 'This is the single most important instruction, follow it exactly: the last ' + referenceParts.length + ' image(s) in this request each show one specific real furniture or decor product from the Hoff catalog. Every main furniture piece in the redesigned room (every sofa, bed, wardrobe, table, chair, storage unit) MUST be exactly that product — same silhouette, same exact color, same exact material and finish as shown in its reference photo, not a similar or reinterpreted version and not a different color. Do not substitute any of them with a different-colored or different-shaped piece. Include every one of these reference items somewhere in the room — do not skip any of them. The requested color palette is MANDATORY for the whole room: walls, floor accents, textiles, decor AND furniture. Keep the shape and design of each reference product, but if its color clearly clashes with the requested palette, recolor that item to a matching palette color. Strictly avoid any saturated color that is not part of the palette.') : '',
       'The next ' + styleFiles.length + ' image(s) (before the Hoff product photos) show different rooms of the same apartment. Use them ONLY for the wall color or wallpaper, the flooring, the materials and the overall color palette of this home — reuse those exactly. Do NOT copy specific furniture pieces from these apartment photos, and do not let their mood override the exact furniture from the Hoff reference photos.',
       userRef ? 'One more image, placed right after the apartment photos and before the Hoff product photos, is a reference photo of a furniture or decor item supplied by the user, related to their request below. ' + USER_REFERENCE_RULES : '',
-      userComment ? 'THE MOST IMPORTANT INSTRUCTION, follow it exactly and let it override anything above or below that conflicts with it: the user wrote this specific request: "' + userComment + '". If this request names or implies specific furniture or changes to keep, make, or avoid, follow it precisely. Anything in the room that this request does not mention should stay as close to the original room photo as possible, even while restyling — do not remove or replace furniture the user did not ask to change.' : '',
+      userComment ? 'THE MOST IMPORTANT INSTRUCTION, follow it exactly and let it override anything above or below that conflicts with it: the user wrote this specific request: "' + userComment + '". If this request names or implies specific furniture or changes to keep, make, or avoid, follow it precisely. Only the items that this request explicitly asks to keep stay as they are in the original room photo. Every other piece of furniture from the original photo is removed and replaced by the catalog products from the reference photos.' : '',
       'At a ' + (budgetPrompt || 'mid-range') + ' furniture budget.',
       'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the first photo — only change the furniture, decor, materials and colors. Do not extend, widen or reveal any part of the room that is not visible in the original photo — if the photo shows only a corner or a partial view of the room, the result must show that exact same corner or partial view, with the exact same crop and framing, not a wider or different part of the room. Do not invent walls, windows, doors or floor area that are not already visible in the original photo.',
       'The final image must look like a single real, professionally staged room, not a collage of separate product photos pasted together. Every piece of furniture must rest naturally and fully on the floor or be mounted the way that exact product is actually mounted in real life — never floating, never cut off. Use one consistent light source, direction and color temperature for the whole scene, with matching shadows, perspective and scale, so the room reads as one coherent, believable photograph.',
@@ -495,8 +510,9 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
       .concat(userRef ? [userRef] : [])
       .concat(referenceParts);
 
-    const { buffer: resultBuffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + refNamesText, images, referenceParts);
+    const { buffer: resultBuffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + buildStrictRules(referenceParts.length, palette) + ' ' + refNamesText, images, referenceParts, palette);
     if (matched) res.set('X-Matched-Items', matched.map(i => refOrigIndex[i]).join(','));
+    res.set('X-Used-Items', refOrigIndex.join(','));
 
     res.set('Content-Type', mimeType);
     res.send(resultBuffer);
