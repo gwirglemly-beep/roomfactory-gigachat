@@ -624,6 +624,10 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const UNISENDER_API_KEY = process.env.UNISENDER_API_KEY;
 const UNISENDER_SENDER_EMAIL = process.env.UNISENDER_SENDER_EMAIL;
+// Unisender требует list_id в sendEmail, даже для одиночных писем вне рассылки.
+// Получатель берётся из параметра email, в список он не добавляется и не виден
+// в контактах — лимит бесплатного тарифа (100 контактов) это не расходует.
+const UNISENDER_LIST_ID = process.env.UNISENDER_LIST_ID || '1';
 const REQUIRE_EMAIL_VERIFICATION = process.env.REQUIRE_EMAIL_VERIFICATION === 'true';
 
 async function sendMail(to, subject, text) {
@@ -637,6 +641,7 @@ async function sendMail(to, subject, text) {
     email: to,
     sender_name: 'Room Factory',
     sender_email: UNISENDER_SENDER_EMAIL,
+    list_id: UNISENDER_LIST_ID,
     subject,
     body: text.replace(/\n/g, '<br>')
   });
