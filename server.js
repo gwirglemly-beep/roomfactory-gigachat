@@ -66,6 +66,37 @@ const AUTH_KEY = process.env.GIGACHAT_AUTH_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = 'gemini-3.1-flash-image';
 
+// ===================================================================
+// Приём оплаты (ЮKassa) — платные тарифы и докупка генераций.
+// ===================================================================
+const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID;
+const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY;
+const YOOKASSA_API = 'https://api.yookassa.ru/v3';
+const YOOKASSA_RETURN_URL = process.env.YOOKASSA_RETURN_URL || 'https://room-factory.ru/?payment=done';
+
+const TARIFF_PLANS = {
+  start: { amount: 299, generations: 10, label: 'Start' },
+  plus: { amount: 499, generations: 20, label: 'Plus' },
+  pro: { amount: 999, generations: 50, label: 'Pro' }
+};
+const TOPUP_PLAN = { amount: 349, generations: 10, label: 'Докупка генераций' };
+
+function yookassaAuthHeader() {
+  return 'Basic ' + Buffer.from(YOOKASSA_SHOP_ID + ':' + YOOKASSA_SECRET_KEY).toString('base64');
+}
+
+async function yookassaRequest(method, path, body, idempotenceKey) {
+  if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) throw new Error('ЮKassa не настроена на сервере (нет YOOKASSA_SHOP_ID/YOOKASSA_SECRET_KEY)');
+  const headers = { 'Authorization': yookassaAuthHeader(), 'Content-Type': 'application/json' };
+  if (idempotenceKey) headers['Idempotence-Key'] = idempotenceKey;
+  const resp = await fetch(YOOKASSA_API + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const text = await resp.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch (e) {}
+  if (!resp.ok) throw new Error('YooKassa ' + method + ' ' + path + ' ' + resp.status + ': ' + text);
+  return data;
+}
+
 // Лимит бесплатных генераций: GEN_LIMIT_TOTAL за всё время на аккаунт (счётчик в БД, users.generations_used).
 // Для гостей без входа — тот же лимит на IP (в памяти сервера, сбрасывается при перезапуске).
 // DAILY_LIMIT_GLOBAL — только защита бюджета: общий потолок генераций в сутки.
@@ -101,13 +132,32 @@ async function reserveGeneration(req, res) {
   if (user) {
     if (UNLIMITED_EMAILS.includes(String(user.email || '').toLowerCase())) { usageGlobal++; return { unlimited: true }; }
     const userId = user.id;
+
+    // Сначала пробуем месячный лимит по платному тарифу.
+    const tariffRows = await pool.query(
+      `UPDATE users SET tariff_generations_used = tariff_generations_used + 1
+       WHERE id = $1 AND tariff != 'free' AND tariff_period_end > now()
+         AND tariff_generations_used < tariff_generations_limit
+       RETURNING tariff_generations_used`,
+      [userId]
+    );
+    if (tariffRows.rows.length) { usageGlobal++; return { userId, source: 'tariff' }; }
+
+    // Затем — докупленные отдельно генерации (не сгорают по тарифному периоду).
+    const topupRows = await pool.query(
+      'UPDATE users SET topup_generations = topup_generations - 1 WHERE id = $1 AND topup_generations > 0 RETURNING topup_generations',
+      [userId]
+    );
+    if (topupRows.rows.length) { usageGlobal++; return { userId, source: 'topup' }; }
+
+    // И только потом — бесплатный лимит на весь аккаунт.
     const { rows } = await pool.query(
       'UPDATE users SET generations_used = generations_used + 1 WHERE id = $1 AND generations_used < $2 RETURNING generations_used',
       [userId, GEN_LIMIT_TOTAL]
     );
     if (!rows.length) { res.status(429).json({ error: 'limit_reached' }); return null; }
     usageGlobal++;
-    return { userId };
+    return { userId, source: 'free' };
   }
 
   const ip = req.ip || 'unknown';
@@ -122,7 +172,13 @@ async function releaseGeneration(reserved) {
   if (!reserved) return;
   try {
     if (reserved.userId) {
-      await pool.query('UPDATE users SET generations_used = GREATEST(generations_used - 1, 0) WHERE id = $1', [reserved.userId]);
+      if (reserved.source === 'tariff') {
+        await pool.query('UPDATE users SET tariff_generations_used = GREATEST(tariff_generations_used - 1, 0) WHERE id = $1', [reserved.userId]);
+      } else if (reserved.source === 'topup') {
+        await pool.query('UPDATE users SET topup_generations = topup_generations + 1 WHERE id = $1', [reserved.userId]);
+      } else {
+        await pool.query('UPDATE users SET generations_used = GREATEST(generations_used - 1, 0) WHERE id = $1', [reserved.userId]);
+      }
     } else if (reserved.ip) {
       const used = usageByIp.get(reserved.ip) || 0;
       if (used > 0) usageByIp.set(reserved.ip, used - 1);
@@ -867,7 +923,10 @@ app.post('/auth/logout', requireAuth, express.json(), async (req, res) => {
 app.get('/auth/me', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT id, email, first_name, last_name, phone, preferred_style FROM users WHERE id = $1',
+      `SELECT id, email, first_name, last_name, phone, preferred_style,
+              tariff, tariff_period_end, tariff_generations_limit, tariff_generations_used,
+              topup_generations, (yookassa_payment_method_id IS NOT NULL) AS has_saved_payment_method
+       FROM users WHERE id = $1`,
       [req.user.id]
     );
     if (!rows.length) { res.status(401).json({ error: 'not_authenticated' }); return; }
@@ -949,6 +1008,153 @@ app.post('/auth/reset-password', authRateLimit('reset-password', 10, 15 * 60 * 1
     res.status(500).json({ error: 'server_error' });
   }
 });
+
+// ===================================================================
+// Оплата тарифов и докупки генераций (ЮKassa)
+// ===================================================================
+
+app.post('/payments/create', requireAuth, express.json(), async (req, res) => {
+  try {
+    const planKey = String(req.body.plan || '');
+    const plan = planKey === 'topup' ? TOPUP_PLAN : TARIFF_PLANS[planKey];
+    if (!plan) { res.status(400).json({ error: 'invalid_plan' }); return; }
+
+    const idempotenceKey = crypto.randomUUID();
+    const payment = await yookassaRequest('POST', '/payments', {
+      amount: { value: plan.amount.toFixed(2), currency: 'RUB' },
+      capture: true,
+      confirmation: { type: 'redirect', return_url: YOOKASSA_RETURN_URL },
+      save_payment_method: planKey !== 'topup',
+      description: 'Room Factory — ' + plan.label,
+      metadata: { userId: String(req.user.id), plan: planKey }
+    }, idempotenceKey);
+
+    await pool.query(
+      'INSERT INTO payments (user_id, yookassa_payment_id, tariff, amount, status) VALUES ($1, $2, $3, $4, $5)',
+      [req.user.id, payment.id, planKey, plan.amount, payment.status]
+    );
+
+    res.json({ confirmationUrl: payment.confirmation && payment.confirmation.confirmation_url });
+  } catch (err) {
+    console.error('payments/create error:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// ЮKassa присылает уведомление об изменении статуса платежа сюда. Телу уведомления
+// не доверяем напрямую (его теоретически может прислать кто угодно) — при получении
+// перепроверяем реальный статус платежа через API ЮKassa своим секретным ключом.
+app.post('/payments/webhook', express.json(), async (req, res) => {
+  try {
+    const paymentId = req.body && req.body.object && req.body.object.id;
+    if (!paymentId) { res.sendStatus(200); return; }
+
+    const payment = await yookassaRequest('GET', '/payments/' + paymentId);
+    if (!payment || payment.status !== 'succeeded') { res.sendStatus(200); return; }
+
+    const existing = await pool.query('SELECT user_id, tariff, status FROM payments WHERE yookassa_payment_id = $1', [paymentId]);
+    if (!existing.rows.length || existing.rows[0].status === 'succeeded') { res.sendStatus(200); return; }
+
+    const userId = existing.rows[0].user_id;
+    const planKey = existing.rows[0].tariff;
+    const paymentMethodId = payment.payment_method && payment.payment_method.saved ? payment.payment_method.id : null;
+
+    await pool.query('UPDATE payments SET status = $1 WHERE yookassa_payment_id = $2', ['succeeded', paymentId]);
+
+    if (planKey === 'topup') {
+      await pool.query('UPDATE users SET topup_generations = topup_generations + $1 WHERE id = $2', [TOPUP_PLAN.generations, userId]);
+    } else if (TARIFF_PLANS[planKey]) {
+      const plan = TARIFF_PLANS[planKey];
+      await pool.query(
+        `UPDATE users SET tariff = $1, tariff_generations_limit = $2, tariff_generations_used = 0,
+           tariff_period_end = now() + interval '30 days',
+           yookassa_payment_method_id = COALESCE($3, yookassa_payment_method_id)
+         WHERE id = $4`,
+        [planKey, plan.generations, paymentMethodId, userId]
+      );
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('payments/webhook error:', err);
+    res.sendStatus(200); // отвечаем 200 в любом случае, чтобы ЮKassa не долбила повторами из-за нашей внутренней ошибки
+  }
+});
+
+app.post('/payments/cancel-subscription', requireAuth, express.json(), async (req, res) => {
+  try {
+    // Текущий оплаченный период остаётся активным до tariff_period_end — просто
+    // убираем сохранённый способ оплаты, чтобы автопродление больше не сработало.
+    await pool.query('UPDATE users SET yookassa_payment_method_id = NULL WHERE id = $1', [req.user.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+async function downgradeToFree(userId, email, oldTariffLabel) {
+  await pool.query(
+    `UPDATE users SET tariff = 'free', tariff_period_end = NULL, tariff_generations_limit = 0,
+       tariff_generations_used = 0, yookassa_payment_method_id = NULL WHERE id = $1`,
+    [userId]
+  );
+  try {
+    await sendMail(
+      email,
+      'Не удалось продлить подписку Room Factory',
+      'Здравствуйте!\n\nНе получилось списать оплату за тариф «' + oldTariffLabel + '» — подписка переведена на бесплатный тариф.\n\nВы можете оформить подписку заново в личном кабинете: https://room-factory.ru/tariffs.html'
+    );
+  } catch (e) { console.error('Не удалось отправить письмо о неудачном автопродлении:', e); }
+}
+
+// Раз в час проверяем, у кого наступил срок автопродления подписки, и списываем
+// сохранённым способом оплаты (без редиректа пользователя). Требует, чтобы ЮKassa
+// подтвердила рекуррентные платежи для магазина — иначе запрос просто завершится
+// ошибкой, и подписка аккуратно переводится на бесплатный тариф с письмом об этом.
+async function chargeRecurringSubscriptions() {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, email, tariff, yookassa_payment_method_id FROM users
+       WHERE tariff != 'free' AND tariff_period_end IS NOT NULL
+         AND tariff_period_end <= now() AND yookassa_payment_method_id IS NOT NULL`
+    );
+    for (const u of rows) {
+      const plan = TARIFF_PLANS[u.tariff];
+      if (!plan) continue;
+      try {
+        const idempotenceKey = crypto.randomUUID();
+        const payment = await yookassaRequest('POST', '/payments', {
+          amount: { value: plan.amount.toFixed(2), currency: 'RUB' },
+          capture: true,
+          payment_method_id: u.yookassa_payment_method_id,
+          description: 'Room Factory — автопродление ' + plan.label
+        }, idempotenceKey);
+
+        await pool.query(
+          'INSERT INTO payments (user_id, yookassa_payment_id, tariff, amount, status) VALUES ($1, $2, $3, $4, $5)',
+          [u.id, payment.id, u.tariff, plan.amount, payment.status]
+        );
+
+        if (payment.status === 'succeeded') {
+          await pool.query(
+            `UPDATE users SET tariff_generations_used = 0, tariff_period_end = now() + interval '30 days' WHERE id = $1`,
+            [u.id]
+          );
+        } else if (payment.status !== 'pending') {
+          await downgradeToFree(u.id, u.email, plan.label);
+        }
+      } catch (e) {
+        console.error('Не удалось продлить подписку для', u.email, e);
+        await downgradeToFree(u.id, u.email, plan.label);
+      }
+    }
+  } catch (e) {
+    console.error('Ошибка выборки подписок для автопродления:', e);
+  }
+}
+setInterval(chargeRecurringSubscriptions, 60 * 60 * 1000).unref();
+chargeRecurringSubscriptions();
 
 // ===================================================================
 // История генераций
