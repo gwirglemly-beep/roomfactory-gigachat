@@ -86,6 +86,22 @@ const TARIFF_PLANS = {
 };
 const TOPUP_PLAN = { amount: 349, generations: 10, label: 'Докупка генераций' };
 
+// Кассовый чек (обязателен по 54-ФЗ) — отправляется покупателю на email через фискализацию ЮKassa.
+// vat_code: 1 — "без НДС" (УСН у ИП). Если в будущем появится НДС — поменять здесь.
+function buildReceipt(email, plan) {
+  return {
+    customer: { email },
+    items: [{
+      description: ('Room Factory — ' + plan.label).slice(0, 128),
+      quantity: '1.00',
+      amount: { value: plan.amount.toFixed(2), currency: 'RUB' },
+      vat_code: 1,
+      payment_mode: 'full_payment',
+      payment_subject: 'service'
+    }]
+  };
+}
+
 function yookassaAuthHeader() {
   return 'Basic ' + Buffer.from(YOOKASSA_SHOP_ID + ':' + YOOKASSA_SECRET_KEY).toString('base64');
 }
@@ -1031,7 +1047,8 @@ app.post('/payments/create', requireAuth, express.json(), async (req, res) => {
       confirmation: { type: 'redirect', return_url: YOOKASSA_RETURN_URL },
       save_payment_method: planKey !== 'topup' && YOOKASSA_RECURRING_ENABLED,
       description: 'Room Factory — ' + plan.label,
-      metadata: { userId: String(req.user.id), plan: planKey }
+      metadata: { userId: String(req.user.id), plan: planKey },
+      receipt: buildReceipt(req.user.email, plan)
     }, idempotenceKey);
 
     await pool.query(
@@ -1133,7 +1150,8 @@ async function chargeRecurringSubscriptions() {
           amount: { value: plan.amount.toFixed(2), currency: 'RUB' },
           capture: true,
           payment_method_id: u.yookassa_payment_method_id,
-          description: 'Room Factory — автопродление ' + plan.label
+          description: 'Room Factory — автопродление ' + plan.label,
+          receipt: buildReceipt(u.email, plan)
         }, idempotenceKey);
 
         await pool.query(
