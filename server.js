@@ -73,6 +73,11 @@ const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID;
 const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY;
 const YOOKASSA_API = 'https://api.yookassa.ru/v3';
 const YOOKASSA_RETURN_URL = process.env.YOOKASSA_RETURN_URL || 'https://room-factory.ru/?payment=done';
+// Пока ЮKassa не подтвердит рекуррентные платежи для магазина, запрос с save_payment_method
+// будет отклонён целиком (403 forbidden) — поэтому по умолчанию не сохраняем способ оплаты,
+// подписка оформляется обычным разовым платежом без автопродления. Когда ЮKassa подтвердит
+// рекуррентные платежи — поставить в Render YOOKASSA_RECURRING_ENABLED=true, без изменения кода.
+const YOOKASSA_RECURRING_ENABLED = process.env.YOOKASSA_RECURRING_ENABLED === 'true';
 
 const TARIFF_PLANS = {
   start: { amount: 299, generations: 10, label: 'Start' },
@@ -1024,7 +1029,7 @@ app.post('/payments/create', requireAuth, express.json(), async (req, res) => {
       amount: { value: plan.amount.toFixed(2), currency: 'RUB' },
       capture: true,
       confirmation: { type: 'redirect', return_url: YOOKASSA_RETURN_URL },
-      save_payment_method: planKey !== 'topup',
+      save_payment_method: planKey !== 'topup' && YOOKASSA_RECURRING_ENABLED,
       description: 'Room Factory — ' + plan.label,
       metadata: { userId: String(req.user.id), plan: planKey }
     }, idempotenceKey);
