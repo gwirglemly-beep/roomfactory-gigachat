@@ -825,6 +825,7 @@ app.post('/auth/register', authRateLimit('register', 10, 15 * 60 * 1000), expres
   try {
     const email = (req.body.email || '').trim().toLowerCase();
     const password = req.body.password || '';
+    const marketingConsent = req.body.marketingConsent === true;
     if (!isValidEmail(email)) { res.status(400).json({ error: 'invalid_email' }); return; }
     if (password.length < 8) { res.status(400).json({ error: 'weak_password' }); return; }
     if (!(await hasMailServer(email))) { res.status(400).json({ error: 'invalid_email' }); return; }
@@ -834,8 +835,8 @@ app.post('/auth/register', authRateLimit('register', 10, 15 * 60 * 1000), expres
 
     const passwordHash = await bcrypt.hash(password, 10);
     const inserted = await pool.query(
-      'INSERT INTO users (email, password_hash, email_verified) VALUES ($1, $2, $3) RETURNING id',
-      [email, passwordHash, !REQUIRE_EMAIL_VERIFICATION]
+      'INSERT INTO users (email, password_hash, email_verified, marketing_consent) VALUES ($1, $2, $3, $4) RETURNING id',
+      [email, passwordHash, !REQUIRE_EMAIL_VERIFICATION, marketingConsent]
     );
     const userId = inserted.rows[0].id;
 
