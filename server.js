@@ -6,6 +6,7 @@ const { GoogleGenAI } = require('@google/genai');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const aws4 = require('aws4');
+const sharp = require('sharp');
 
 dns.setDefaultResultOrder('ipv4first');
 
@@ -65,6 +66,11 @@ const AUTH_KEY = process.env.GIGACHAT_AUTH_KEY;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = 'gemini-3.1-flash-image';
+
+// Включается переменной окружения PAUSE_GOOGLE_GENERATION=true в Render — временно
+// отключает отправку фото в Google Gemini (например, на 10 рабочих дней после подачи
+// уведомления о трансграничной передаче в РКН), не трогая остальной сайт/регистрацию.
+const PAUSE_GOOGLE_GENERATION = process.env.PAUSE_GOOGLE_GENERATION === 'true';
 
 // ===================================================================
 // Приём оплаты (ЮKassa) — платные тарифы и докупка генераций.
@@ -519,10 +525,68 @@ async function fetchReferenceParts(referenceUrls, limit) {
 
 const USER_REFERENCE_RULES = 'Follow the user\'s instruction about this photo precisely: if they say they want exactly this item (for example "точно такой", "именно этот", "exactly this one"), reproduce it faithfully — same shape, same color, same material. If they ask for something similar, place a similar item of the same type and style instead. If their instruction says to change only this one item and keep everything else, do exactly that: modify only what this photo and instruction describe, and leave every other piece of furniture and decor in the room exactly as it is in the original room photo, unchanged.';
 
+// Убираем EXIF-метаданные (GPS-координаты квартиры, модель и серийник устройства, автор) из фото,
+// которое прислал пользователь, перед тем как оно уйдёт в Google Gemini — по рекомендации юриста,
+// чтобы передача не превращалась в передачу персональных данных. sharp() по умолчанию не копирует
+// метаданные в результат (если не вызывать withMetadata()), .rotate() без аргументов сначала
+// физически разворачивает кадр по EXIF-ориентации, чтобы фото не легло набок после удаления этого тега.
+async function stripImageMetadata(buffer, mimetype) {
+  try {
+    const isPng = /png/i.test(mimetype || '');
+    const img = sharp(buffer).rotate();
+    const out = isPng ? await img.png().toBuffer() : await img.jpeg({ quality: 92 }).toBuffer();
+    return { buffer: out, mimetype: isPng ? 'image/png' : 'image/jpeg' };
+  } catch (e) {
+    console.error('exif strip failed, sending original buffer:', e && e.message);
+    return { buffer, mimetype };
+  }
+}
+
+// Проверка загруженного фото перед генерацией: это должна быть пустая или обставленная комната,
+// без людей и частей тела в кадре, без документов, экранов с личными данными и именных табличек/дипломов —
+// по рекомендации юриста такие кадры могут сделать передачу фото в Google передачей персональных данных.
+// Обычные картины/постеры/абстрактная фотография на стене как декор — это нормально, не персональные данные.
+// Если проверка сама не удалась (сбой модели) — пропускаем фото (fail-open), чтобы не блокировать пользователей зря.
+async function checkRoomPhoto(buffer, mimetype) {
+  const client = getGeminiClient();
+  const parts = [
+    { text: 'You are a content and privacy filter for an interior-design app. The image must be a photo of an empty or furnished room interior (walls, floor, furniture) suitable for redesign, with nothing in it that could identify a real person. ' +
+      'Reject it if ANY of these appear in the room: ' +
+      '(1) a real person or a visible human body part (face, hand, arm, leg, etc.); ' +
+      '(2) a document with legible text (passport, ID, certificate, contract, utility bill, letter); ' +
+      '(3) a screen (phone, computer, TV) showing legible personal content such as messages, photos of people or an account/profile; ' +
+      '(4) a personal photograph or portrait of a real person (a family photo, a selfie print, a portrait print) displayed in a frame, on a shelf or on a table — this is different from generic wall art/posters/paintings/abstract or stock photography, which are normal decor and are allowed; ' +
+      '(5) a nameplate, personalized diploma, certificate, award or badge showing a real person\'s name; ' +
+      '(6) the image is clearly not a room/interior photo at all (e.g. a random object close-up, an outdoor scene, an animal). ' +
+      'Answer with ONLY a JSON object: {"ok": true or false, "reason": "short reason in Russian, under 90 characters, explaining to the user what to fix, empty string if ok is true"}.' },
+    { inlineData: { mimeType: mimetype || 'image/jpeg', data: buffer.toString('base64') } }
+  ];
+  for (const model of verifyModelOrder()) {
+    try {
+      const response = await client.models.generateContent({ model, contents: [{ role: 'user', parts }] });
+      const text = geminiResponseText(response);
+      const m = text.match(/\{[\s\S]*\}/);
+      if (m) {
+        const obj = JSON.parse(m[0]);
+        goodVerifyModel = model;
+        return { ok: obj.ok !== false, reason: typeof obj.reason === 'string' ? obj.reason.trim().slice(0, 200) : '' };
+      }
+    } catch (e) {
+      console.error('room photo check failed with model ' + model + ':', e && e.message);
+      if (e && (e.status === 404 || /NOT_FOUND|no longer available/i.test(String(e.message || '')))) badVerifyModels.add(model);
+    }
+  }
+  return { ok: true, reason: '' };
+}
+
 app.post('/generate', upload.single('image'), async (req, res) => {
   let reserved = null;
   try {
+    if (PAUSE_GOOGLE_GENERATION) { res.status(503).json({ error: 'generation_temporarily_paused' }); return; }
     if (!req.file) { res.status(400).json({ error: 'no image' }); return; }
+    { const cleaned = await stripImageMetadata(req.file.buffer, req.file.mimetype); req.file.buffer = cleaned.buffer; req.file.mimetype = cleaned.mimetype; }
+    const roomCheck = await checkRoomPhoto(req.file.buffer, req.file.mimetype);
+    if (!roomCheck.ok) { res.status(400).json({ error: 'photo_rejected', reason: roomCheck.reason || 'Загрузите, пожалуйста, фото комнаты без людей.' }); return; }
     reserved = await reserveGeneration(req, res);
     if (!reserved) return;
     const styleGuidance = req.body.prompt || '';
@@ -535,7 +599,8 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     try { refNames = JSON.parse(req.body.referenceNames || '[]'); } catch (e) {}
     const palette = String(req.body.palette || '').slice(0, 200);
     const refNamesText = referenceParts.length ? 'The last ' + referenceParts.length + ' reference photos, in order, are these catalog products: ' + refOrigIndex.map((o, i) => (i + 1) + ') ' + String(refNames[o] || 'product').slice(0, 120) + mountHint(refNames[o])).join('; ') + '. Reproduce each of them as shown. Ceiling lights, chandeliers and pendant lamps always hang from the ceiling; wall-mounted items are always on the wall; never place them on the floor.' : '';
-    const userRef = parseUserReference(req.body.userReferenceImage);
+    let userRef = parseUserReference(req.body.userReferenceImage);
+    if (userRef) userRef = await stripImageMetadata(userRef.buffer, userRef.mimetype);
 
     const fullPrompt = [
       'Redesign this exact room photo, using this style guidance as the general direction: ' + styleGuidance + '.',
@@ -545,7 +610,8 @@ app.post('/generate', upload.single('image'), async (req, res) => {
       referenceParts.length ? (userComment
         ? 'The last ' + referenceParts.length + ' reference photo(s) show real furniture or decor products from the Hoff catalog, matching the overall style. Use them only to style or furnish parts of the room that the user\'s request above does not already cover or ask to keep — never use them to replace or remove anything the user asked to keep unchanged.'
         : 'Each of the last ' + referenceParts.length + ' reference photo(s) shows a real furniture or decor product (sofa, chair, bed, table, wardrobe, shelf, lamp, rug, etc.) from the Hoff catalog that must appear in the redesigned room, placed appropriately for its type and matching its exact appearance (shape, material, color) as closely as possible. Every reference item should be included — do not skip any of them. All the main furniture pieces (sofas, beds, wardrobes, tables, chairs, storage units) must come strictly from these reference photos — do not invent or substitute any other furniture. You may add small atmospheric details not shown in the references, such as wallpaper or wall paint, curtains, books, notebooks, plants, cushions or other small decor — but keep these secondary and never let them replace or compete with the main reference furniture. Never add unrelated objects that were not in the original room photo and are not furniture or plain decor — no appliances, no pet items, no electronics, nothing that was not requested. Choose the wall color or wallpaper, floor tone and any added decor so they harmonize with the color palette of the reference furniture — do not use a wall color that clashes with it. The requested color palette is MANDATORY for the whole room: walls, floor accents, textiles, decor AND furniture. Keep the shape and design of each reference product, but if its color clearly clashes with the requested palette, recolor that item to a matching palette color. Strictly avoid any saturated color that is not part of the palette.') : '',
-      'This is the most important part regardless of the above: the final image must look like a single real, professionally staged room, not a collage of separate product photos pasted together. Every piece of furniture must rest naturally and fully on the floor or be mounted the way that exact product is actually mounted in real life — never floating, never cut off, never overlapping another object incorrectly. Use one consistent light source, direction and color temperature for the whole scene, with matching shadows and reflections on every item, matching perspective and scale for every piece relative to the room and to each other, so the whole room reads as one coherent, cozy, believable photograph — not a set of furniture items placed next to each other.'
+      'This is the most important part regardless of the above: the final image must look like a single real, professionally staged room, not a collage of separate product photos pasted together. Every piece of furniture must rest naturally and fully on the floor or be mounted the way that exact product is actually mounted in real life — never floating, never cut off, never overlapping another object incorrectly. Use one consistent light source, direction and color temperature for the whole scene, with matching shadows and reflections on every item, matching perspective and scale for every piece relative to the room and to each other, so the whole room reads as one coherent, cozy, believable photograph — not a set of furniture items placed next to each other.',
+      'Never add any people, human figures, silhouettes, hands, faces, pets, or personal photographs/portraits of people into the room — the result must show only the empty-of-people, staged interior itself.'
     ].filter(Boolean).join(' ');
 
     const images = [{ buffer: req.file.buffer, mimetype: req.file.mimetype }]
@@ -586,10 +652,17 @@ app.post('/classify-style', upload.single('image'), async (req, res) => {
 app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'apartmentPhotos', maxCount: 7 }]), async (req, res) => {
   let reserved = null;
   try {
+    if (PAUSE_GOOGLE_GENERATION) { res.status(503).json({ error: 'generation_temporarily_paused' }); return; }
     const targetFile = req.files && req.files.image && req.files.image[0];
     const styleFiles = (req.files && req.files.apartmentPhotos) || [];
     if (!targetFile) { res.status(400).json({ error: 'no image' }); return; }
     if (!styleFiles.length) { res.status(400).json({ error: 'no apartment photos' }); return; }
+    { const cleaned = await stripImageMetadata(targetFile.buffer, targetFile.mimetype); targetFile.buffer = cleaned.buffer; targetFile.mimetype = cleaned.mimetype; }
+    await Promise.all(styleFiles.map(async f => { const cleaned = await stripImageMetadata(f.buffer, f.mimetype); f.buffer = cleaned.buffer; f.mimetype = cleaned.mimetype; }));
+    // Проверяем не только главное фото, но и все остальные фото квартиры — они тоже уходят в Google.
+    const allRoomChecks = await Promise.all([targetFile, ...styleFiles].map(f => checkRoomPhoto(f.buffer, f.mimetype)));
+    const firstBadCheck = allRoomChecks.find(c => !c.ok);
+    if (firstBadCheck) { res.status(400).json({ error: 'photo_rejected', reason: firstBadCheck.reason || 'Загрузите, пожалуйста, фото комнаты без людей.' }); return; }
     reserved = await reserveGeneration(req, res);
     if (!reserved) return;
 
@@ -604,7 +677,8 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
     try { refNames = JSON.parse(req.body.referenceNames || '[]'); } catch (e) {}
     const palette = '';
     const refNamesText = referenceParts.length ? 'The last ' + referenceParts.length + ' reference photos, in order, are these catalog products: ' + refOrigIndex.map((o, i) => (i + 1) + ') ' + String(refNames[o] || 'product').slice(0, 120) + mountHint(refNames[o])).join('; ') + '. Reproduce each of them as shown. Ceiling lights, chandeliers and pendant lamps always hang from the ceiling; wall-mounted items are always on the wall; never place them on the floor.' : '';
-    const userRef = parseUserReference(req.body.userReferenceImage);
+    let userRef = parseUserReference(req.body.userReferenceImage);
+    if (userRef) userRef = await stripImageMetadata(userRef.buffer, userRef.mimetype);
 
     const fullPrompt = [
       'The first image is a photo of a room that needs a new interior design: ' + (room || 'a room') + '.',
@@ -617,6 +691,7 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
       'At a ' + (budgetPrompt || 'mid-range') + ' furniture budget.',
       'Keep the exact same room layout, walls, windows, doors, proportions and camera angle as in the first photo — only change the furniture, decor, materials and colors. Do not extend, widen or reveal any part of the room that is not visible in the original photo — if the photo shows only a corner or a partial view of the room, the result must show that exact same corner or partial view, with the exact same crop and framing, not a wider or different part of the room. Do not invent walls, windows, doors or floor area that are not already visible in the original photo.',
       'The final image must look like a single real, professionally staged room, not a collage of separate product photos pasted together. Every piece of furniture must rest naturally and fully on the floor or be mounted the way that exact product is actually mounted in real life — never floating, never cut off. Use one consistent light source, direction and color temperature for the whole scene, with matching shadows, perspective and scale, so the room reads as one coherent, believable photograph.',
+      'Never add any people, human figures, silhouettes, hands, faces, pets, or personal photographs/portraits of people into the room — the result must show only the empty-of-people, staged interior itself.',
       'Professional interior photography, photorealistic.'
     ].filter(Boolean).join(' ');
 
