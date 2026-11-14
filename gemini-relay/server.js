@@ -86,7 +86,7 @@ async function generateWithGemini(promptText, images) {
 }
 
 // Та же бело-список хостов, что был на основном сервере — фото мебели только с этого CDN.
-const ALLOWED_IMAGE_HOSTS = ['avatars.mds.yandex.net'];
+const ALLOWED_IMAGE_HOSTS = ['avatars.mds.yandex.net', 'static.tildacdn.com'];
 
 function isAllowedImageUrl(url) {
   try {
