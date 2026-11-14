@@ -580,39 +580,41 @@ async function timewebS3Request(method, path, body, contentType) {
   return resp;
 }
 
-// Почта отправляется через собственный ящик на Timeweb Mail (SMTP), а не через
-// сторонний сервис — ящик уже создан в панели Timeweb. Логин для SMTP — это сам
-// адрес ящика, пароль — пароль от него (TIMEWEB_MAIL_USER / TIMEWEB_MAIL_PASSWORD).
-const TIMEWEB_MAIL_USER = process.env.TIMEWEB_MAIL_USER;
-const TIMEWEB_MAIL_PASSWORD = process.env.TIMEWEB_MAIL_PASSWORD;
-const TIMEWEB_MAIL_HOST = process.env.TIMEWEB_MAIL_HOST || 'smtp.timeweb.ru';
-const TIMEWEB_MAIL_PORT = process.env.TIMEWEB_MAIL_PORT ? parseInt(process.env.TIMEWEB_MAIL_PORT, 10) : 465;
+// Почта — через HTTPS API Unisender, а не через SMTP: Timeweb App Platform (как и
+// Render раньше) блокирует исходящие SMTP-порты (465/587) у приложений, обычный
+// HTTPS — нет, поэтому именно так это уже было сделано и проверено раньше.
+const UNISENDER_API_KEY = process.env.UNISENDER_API_KEY;
+const UNISENDER_SENDER_EMAIL = process.env.UNISENDER_SENDER_EMAIL;
+// Unisender требует list_id в sendEmail, даже для одиночных писем вне рассылки.
+// Получатель берётся из параметра email, в список он не добавляется и не виден
+// в контактах — лимит бесплатного тарифа (100 контактов) это не расходует.
+const UNISENDER_LIST_ID = process.env.UNISENDER_LIST_ID || '1';
 const REQUIRE_EMAIL_VERIFICATION = process.env.REQUIRE_EMAIL_VERIFICATION === 'true';
 
-let mailTransport = null;
-function getMailTransport() {
-  if (!mailTransport) {
-    mailTransport = nodemailer.createTransport({
-      host: TIMEWEB_MAIL_HOST,
-      port: TIMEWEB_MAIL_PORT,
-      secure: TIMEWEB_MAIL_PORT === 465,
-      auth: { user: TIMEWEB_MAIL_USER, pass: TIMEWEB_MAIL_PASSWORD }
-    });
-  }
-  return mailTransport;
-}
-
 async function sendMail(to, subject, text) {
-  if (!TIMEWEB_MAIL_USER || !TIMEWEB_MAIL_PASSWORD) {
+  if (!UNISENDER_API_KEY || !UNISENDER_SENDER_EMAIL) {
     console.error('Почтовый сервис не настроен, письмо не отправлено:', to, subject);
     return;
   }
-  await getMailTransport().sendMail({
-    from: '"Room Factory" <' + TIMEWEB_MAIL_USER + '>',
-    to,
+  const params = new URLSearchParams({
+    format: 'json',
+    api_key: UNISENDER_API_KEY,
+    email: to,
+    sender_name: 'Room Factory',
+    sender_email: UNISENDER_SENDER_EMAIL,
+    list_id: UNISENDER_LIST_ID,
     subject,
-    text
+    body: text.replace(/\n/g, '<br>')
   });
+  const resp = await fetch('https://api.unisender.com/ru/api/sendEmail', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  });
+  const data = await resp.json();
+  if (!resp.ok || data.error) {
+    throw new Error('Unisender API: ' + (data.error || resp.status));
+  }
 }
 
 function isValidEmail(email) {
