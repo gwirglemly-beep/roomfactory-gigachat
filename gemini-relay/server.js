@@ -242,7 +242,42 @@ async function checkRoomPhoto(buffer, mimetype) {
   return { ok: true, reason: '' };
 }
 
-const USER_REFERENCE_RULES = 'Follow the user\'s instruction about this photo precisely: if they say they want exactly this item (for example "точно такой", "именно этот", "exactly this one"), reproduce it faithfully — same shape, same color, same material. If they ask for something similar, place a similar item of the same type and style instead. If their instruction says to change only this one item and keep everything else, do exactly that: modify only what this photo and instruction describe, and leave every other piece of furniture and decor in the room exactly as it is in the original room photo, unchanged.';
+// Проверка фото-образца мебели, которое пользователь может прикрепить отдельно к комментарию
+// ("точно такой диван, как на этом фото") — в отличие от checkRoomPhoto, здесь не требуется,
+// чтобы на фото была именно комната: это может быть один предмет мебели крупным планом.
+// Проверяем только на людей/документы/личные данные.
+async function checkReferencePhoto(buffer, mimetype) {
+  const client = getGeminiClient();
+  const parts = [
+    { text: 'You are a content and privacy filter for an interior-design app. This photo is a reference image of a furniture or decor item (or any other everyday object) supplied by a user, with nothing in it that could identify a real person. ' +
+      'Reject it if ANY of these appear in the photo: ' +
+      '(1) a real person or a visible human body part (face, hand, arm, leg, etc.); ' +
+      '(2) a document with legible text (passport, ID, certificate, contract, utility bill, letter); ' +
+      '(3) a screen (phone, computer, TV) showing legible personal content such as messages, photos of people or an account/profile; ' +
+      '(4) a personal photograph or portrait of a real person (a family photo, a selfie print, a portrait print) visible in the photo; ' +
+      '(5) a nameplate, personalized diploma, certificate, award or badge showing a real person\'s name. ' +
+      'Answer with ONLY a JSON object: {"ok": true or false, "reason": "short reason in Russian, under 90 characters, explaining to the user what to fix, empty string if ok is true"}.' },
+    { inlineData: { mimeType: mimetype || 'image/jpeg', data: buffer.toString('base64') } }
+  ];
+  for (const model of verifyModelOrder()) {
+    try {
+      const response = await client.models.generateContent({ model, contents: [{ role: 'user', parts }] });
+      const text = geminiResponseText(response);
+      const m = text.match(/\{[\s\S]*\}/);
+      if (m) {
+        const obj = JSON.parse(m[0]);
+        goodVerifyModel = model;
+        return { ok: obj.ok !== false, reason: typeof obj.reason === 'string' ? obj.reason.trim().slice(0, 200) : '' };
+      }
+    } catch (e) {
+      console.error('reference photo check failed with model ' + model + ':', e && e.message);
+      if (e && (e.status === 404 || /NOT_FOUND|no longer available/i.test(String(e.message || '')))) badVerifyModels.add(model);
+    }
+  }
+  return { ok: true, reason: '' };
+}
+
+const USER_REFERENCE_RULES ='Follow the user\'s instruction about this photo precisely: if they say they want exactly this item (for example "точно такой", "именно этот", "exactly this one"), reproduce it faithfully — same shape, same color, same material. If they ask for something similar, place a similar item of the same type and style instead. If their instruction says to change only this one item and keep everything else, do exactly that: modify only what this photo and instruction describe, and leave every other piece of furniture and decor in the room exactly as it is in the original room photo, unchanged.';
 
 function b64ToBuf(img) {
   return { buffer: Buffer.from(img.data, 'base64'), mimetype: img.mimetype };
@@ -255,6 +290,18 @@ app.post('/check-photo', requireSharedSecret, async (req, res) => {
     const { image, mimetype } = req.body || {};
     if (!image) { res.status(400).json({ error: 'no image' }); return; }
     const result = await checkRoomPhoto(Buffer.from(image, 'base64'), mimetype);
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+app.post('/check-reference-photo', requireSharedSecret, async (req, res) => {
+  try {
+    const { image, mimetype } = req.body || {};
+    if (!image) { res.status(400).json({ error: 'no image' }); return; }
+    const result = await checkReferencePhoto(Buffer.from(image, 'base64'), mimetype);
     res.json(result);
   } catch (err) {
     console.error(err);

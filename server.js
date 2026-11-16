@@ -366,9 +366,15 @@ async function stripImageMetadata(buffer, mimetype) {
 const COMMENT_PHONE_RE = /(\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}/;
 const COMMENT_EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
 const COMMENT_LONGDIGITS_RE = /\d[\d\s\-]{9,}\d/; // 10+ цифр подряд (паспорт, карта, СНИЛС и т.п.)
+// Адресные маркеры — "улица", "проспект" и т.п. однозначны и ловятся всегда; "д." и "дом" (номер дома)
+// и "кв." (номер квартиры) требуют рядом цифру, иначе ловили бы обычные фразы вроде "и т.д.",
+// "20 кв.м" или "дом в скандинавском стиле", не имеющие отношения к адресу.
+const COMMENT_ADDRESS_WORD_RE = /(?:^|[^a-zа-яё])(ул\.|улица|проспект|пр-т|пр-кт|переулок|шоссе|набережная|бульвар|квартира)(?:[^a-zа-яё]|$)/i;
+const COMMENT_ADDRESS_NUMBERED_RE = /(?:^|[^a-zа-яё])(д\.|дом|кв\.)\s*№?\s*\d/i;
 function containsLikelyPersonalData(text) {
   if (!text) return false;
-  return COMMENT_PHONE_RE.test(text) || COMMENT_EMAIL_RE.test(text) || COMMENT_LONGDIGITS_RE.test(text);
+  return COMMENT_PHONE_RE.test(text) || COMMENT_EMAIL_RE.test(text) || COMMENT_LONGDIGITS_RE.test(text) ||
+    COMMENT_ADDRESS_WORD_RE.test(text) || COMMENT_ADDRESS_NUMBERED_RE.test(text);
 }
 
 // Проверка загруженного фото перед генерацией (есть ли люди/документы/т.п.) теперь выполняется
@@ -383,6 +389,18 @@ async function checkRoomPhoto(buffer, mimetype) {
   }
 }
 
+// Та же проверка на людей/документы, но для фото-образца мебели, которое пользователь может
+// прикрепить отдельно к комментарию ("точно такой диван, как на этом фото") — в отличие от
+// основного фото комнаты, это может быть один предмет мебели крупным планом, а не интерьер.
+async function checkReferencePhoto(buffer, mimetype) {
+  try {
+    return await callRelay('/check-reference-photo', { image: buffer.toString('base64'), mimetype });
+  } catch (e) {
+    console.error('relay check-reference-photo failed:', e && e.message);
+    return { ok: true, reason: '' };
+  }
+}
+
 app.post('/generate', upload.single('image'), async (req, res) => {
   let reserved = null;
   try {
@@ -391,6 +409,12 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     { const cleaned = await stripImageMetadata(req.file.buffer, req.file.mimetype); req.file.buffer = cleaned.buffer; req.file.mimetype = cleaned.mimetype; }
     const roomCheck = await checkRoomPhoto(req.file.buffer, req.file.mimetype);
     if (!roomCheck.ok) { res.status(400).json({ error: 'photo_rejected', reason: roomCheck.reason || 'Загрузите, пожалуйста, фото комнаты без людей.' }); return; }
+    let userRef = parseUserReference(req.body.userReferenceImage);
+    if (userRef) {
+      userRef = await stripImageMetadata(userRef.buffer, userRef.mimetype);
+      const userRefCheck = await checkReferencePhoto(userRef.buffer, userRef.mimetype);
+      if (!userRefCheck.ok) { res.status(400).json({ error: 'photo_rejected', reason: userRefCheck.reason || 'Фото-образец не должно содержать людей, лица или документы.' }); return; }
+    }
     const userComment = (req.body.comment || '').trim();
     if (containsLikelyPersonalData(userComment)) { res.status(400).json({ error: 'comment_rejected' }); return; }
     reserved = await reserveGeneration(req, res);
@@ -402,8 +426,6 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     let refNames = [];
     try { refNames = JSON.parse(req.body.referenceNames || '[]'); } catch (e) {}
     const palette = String(req.body.palette || '').slice(0, 200);
-    let userRef = parseUserReference(req.body.userReferenceImage);
-    if (userRef) userRef = await stripImageMetadata(userRef.buffer, userRef.mimetype);
 
     const relayResult = await callRelay('/generate', {
       styleGuidance, userComment, palette,
@@ -459,6 +481,12 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
     const allRoomChecks = await Promise.all([targetFile, ...styleFiles].map(f => checkRoomPhoto(f.buffer, f.mimetype)));
     const firstBadCheck = allRoomChecks.find(c => !c.ok);
     if (firstBadCheck) { res.status(400).json({ error: 'photo_rejected', reason: firstBadCheck.reason || 'Загрузите, пожалуйста, фото комнаты без людей.' }); return; }
+    let userRef = parseUserReference(req.body.userReferenceImage);
+    if (userRef) {
+      userRef = await stripImageMetadata(userRef.buffer, userRef.mimetype);
+      const userRefCheck = await checkReferencePhoto(userRef.buffer, userRef.mimetype);
+      if (!userRefCheck.ok) { res.status(400).json({ error: 'photo_rejected', reason: userRefCheck.reason || 'Фото-образец не должно содержать людей, лица или документы.' }); return; }
+    }
     const userComment = (req.body.comment || '').trim();
     if (containsLikelyPersonalData(userComment)) { res.status(400).json({ error: 'comment_rejected' }); return; }
     reserved = await reserveGeneration(req, res);
@@ -471,8 +499,6 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
     try { referenceUrls = JSON.parse(req.body.referenceImageUrls || '[]'); } catch (e) {}
     let refNames = [];
     try { refNames = JSON.parse(req.body.referenceNames || '[]'); } catch (e) {}
-    let userRef = parseUserReference(req.body.userReferenceImage);
-    if (userRef) userRef = await stripImageMetadata(userRef.buffer, userRef.mimetype);
 
     const relayResult = await callRelay('/generate-apartment', {
       room, budgetPrompt, userComment,
