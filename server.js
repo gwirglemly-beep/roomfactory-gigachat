@@ -357,6 +357,20 @@ async function stripImageMetadata(buffer, mimetype) {
   }
 }
 
+// Простая локальная проверка комментария пользователя на явные персональные данные
+// (телефон, email, номера документов) — выполняется здесь же, на сервере в РФ, без
+// обращения к каким-либо внешним сервисам. Комментарий всё равно уходит в Gemini вместе
+// с фото мебели (для функций "отредактировать дизайн" и "точно такой же"), поэтому перед
+// отправкой нужно убедиться, что в нём нет персональных данных — аналогично тому, как
+// фото проверяются на наличие людей/документов перед отправкой.
+const COMMENT_PHONE_RE = /(\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}/;
+const COMMENT_EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
+const COMMENT_LONGDIGITS_RE = /\d[\d\s\-]{9,}\d/; // 10+ цифр подряд (паспорт, карта, СНИЛС и т.п.)
+function containsLikelyPersonalData(text) {
+  if (!text) return false;
+  return COMMENT_PHONE_RE.test(text) || COMMENT_EMAIL_RE.test(text) || COMMENT_LONGDIGITS_RE.test(text);
+}
+
 // Проверка загруженного фото перед генерацией (есть ли люди/документы/т.п.) теперь выполняется
 // на relay (см. gemini-relay/server.js) — та же логика, просто физически вызывается оттуда.
 // Если relay недоступен или ответил с ошибкой — пропускаем фото (fail-open), как было раньше.
@@ -377,10 +391,11 @@ app.post('/generate', upload.single('image'), async (req, res) => {
     { const cleaned = await stripImageMetadata(req.file.buffer, req.file.mimetype); req.file.buffer = cleaned.buffer; req.file.mimetype = cleaned.mimetype; }
     const roomCheck = await checkRoomPhoto(req.file.buffer, req.file.mimetype);
     if (!roomCheck.ok) { res.status(400).json({ error: 'photo_rejected', reason: roomCheck.reason || 'Загрузите, пожалуйста, фото комнаты без людей.' }); return; }
+    const userComment = (req.body.comment || '').trim();
+    if (containsLikelyPersonalData(userComment)) { res.status(400).json({ error: 'comment_rejected' }); return; }
     reserved = await reserveGeneration(req, res);
     if (!reserved) return;
     const styleGuidance = req.body.prompt || '';
-    const userComment = (req.body.comment || '').trim();
 
     let referenceUrls = [];
     try { referenceUrls = JSON.parse(req.body.referenceImageUrls || '[]'); } catch (e) {}
@@ -444,12 +459,13 @@ app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, {
     const allRoomChecks = await Promise.all([targetFile, ...styleFiles].map(f => checkRoomPhoto(f.buffer, f.mimetype)));
     const firstBadCheck = allRoomChecks.find(c => !c.ok);
     if (firstBadCheck) { res.status(400).json({ error: 'photo_rejected', reason: firstBadCheck.reason || 'Загрузите, пожалуйста, фото комнаты без людей.' }); return; }
+    const userComment = (req.body.comment || '').trim();
+    if (containsLikelyPersonalData(userComment)) { res.status(400).json({ error: 'comment_rejected' }); return; }
     reserved = await reserveGeneration(req, res);
     if (!reserved) return;
 
     const room = req.body.room || '';
     const budgetPrompt = req.body.budgetPrompt || '';
-    const userComment = (req.body.comment || '').trim();
 
     let referenceUrls = [];
     try { referenceUrls = JSON.parse(req.body.referenceImageUrls || '[]'); } catch (e) {}
