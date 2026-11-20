@@ -663,6 +663,32 @@ function isValidEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 200;
 }
 
+// Ссылка «Отписаться» в рекламных письмах: токен — HMAC от email, ничего не хранить
+// в базе не нужно, ссылка работает без входа в аккаунт. См. эндпоинт GET /unsubscribe.
+const UNSUBSCRIBE_SECRET = process.env.UNSUBSCRIBE_SECRET || RELAY_SHARED_SECRET || 'room-factory-unsubscribe';
+function unsubscribeToken(email) {
+  return crypto.createHmac('sha256', UNSUBSCRIBE_SECRET).update(String(email).trim().toLowerCase()).digest('hex').slice(0, 32);
+}
+function unsubscribeLink(email) {
+  return 'https://room-factory.ru/unsubscribe?email=' + encodeURIComponent(email) + '&token=' + unsubscribeToken(email);
+}
+
+// Все рекламные и информационные письма (в отличие от служебных — код подтверждения,
+// сброс пароля, статус подписки) должны идти через эту функцию: она сама проверяет
+// galочку marketing_consent перед отправкой и сама добавляет ссылку «Отписаться».
+async function sendMarketingMail(email, subject, text) {
+  let rows;
+  try {
+    ({ rows } = await pool.query('SELECT marketing_consent FROM users WHERE email = $1', [email]));
+  } catch (e) {
+    console.error('Не удалось проверить marketing_consent перед рекламной рассылкой:', email, e);
+    return;
+  }
+  if (!rows.length || !rows[0].marketing_consent) return;
+  const footer = '\n\n---\nВы получили это письмо, потому что подписаны на рассылку Room Factory.\nОтписаться: ' + unsubscribeLink(email);
+  await sendMail(email, subject, text + footer);
+}
+
 function hasMailServer(email) {
   return new Promise((resolve) => {
     const domain = email.split('@')[1];
@@ -1151,6 +1177,25 @@ app.delete('/generations/:id', requireAuth, async (req, res) => {
 
 app.get('/', (req, res) => res.send('Room Factory GigaChat + Gemini proxy is running'));
 
+// Отписка от рекламных рассылок по ссылке из письма — без входа в аккаунт.
+// Ссылка содержит email и подписанный HMAC-токен (см. unsubscribeLink выше),
+// поэтому отписать можно только владельца конкретного адреса, а не любой email.
+app.get('/unsubscribe', async (req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  const email = String(req.query.email || '').trim().toLowerCase();
+  const token = String(req.query.token || '');
+  if (!email || !token || token !== unsubscribeToken(email)) {
+    res.status(400).send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Ссылка недействительна — Room Factory</title></head><body style="font-family:Arial,sans-serif;max-width:480px;margin:80px auto;text-align:center;color:#1a1208"><p>Ссылка для отписки недействительна или повреждена. Напишите на center@room-factory.ru, чтобы отписаться вручную.</p></body></html>');
+    return;
+  }
+  try {
+    await pool.query('UPDATE users SET marketing_consent = FALSE WHERE email = $1', [email]);
+  } catch (e) {
+    console.error('Не удалось выполнить отписку:', email, e);
+  }
+  res.send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Вы отписаны — Room Factory</title></head><body style="font-family:Arial,sans-serif;max-width:480px;margin:80px auto;text-align:center;color:#1a1208"><p>Вы отписаны от рекламных и информационных рассылок Room Factory.</p><p style="color:#8a7a66;font-size:13px">Служебные письма — код подтверждения, сброс пароля, статус подписки — продолжат приходить, они не относятся к рекламе.</p></body></html>');
+});
+
 // Письмо-напоминание тем, кто зарегистрировался и подтвердил почту, но ни разу
 // не пробовал сервис. Уходит один раз, примерно через REENGAGEMENT_DAYS дней после
 // регистрации. Нужны колонки users.created_at и users.reengagement_sent_at —
@@ -1165,19 +1210,19 @@ async function sendReengagementEmails() {
        WHERE email_verified = TRUE
          AND generations_used = 0
          AND reengagement_sent_at IS NULL
+         AND marketing_consent = TRUE
          AND created_at <= now() - ($1 || ' days')::interval
          AND created_at > now() - ($1 || ' days')::interval - interval '1 day'`,
       [String(REENGAGEMENT_DAYS)]
     );
     for (const u of rows) {
       try {
-        await sendMail(
+        await sendMarketingMail(
           u.email,
           'Попробуйте создать дизайн за 30 секунд',
           'Здравствуйте!\n\n' +
           'Вы зарегистрировались на Room Factory, но ещё не пробовали создать дизайн комнаты.\n\n' +
-          'Загрузите одно фото своей комнаты — и за 30 секунд получите готовый вариант интерьера с подбором мебели из каталога: https://room-factory.ru\n\n' +
-          'Если вы уже израсходовали бесплатные генерации или это письмо вам не актуально, можно просто его не замечать.'
+          'Загрузите одно фото своей комнаты — и за 30 секунд получите готовый вариант интерьера с подбором мебели из каталога: https://room-factory.ru'
         );
         await pool.query('UPDATE users SET reengagement_sent_at = now() WHERE id = $1', [u.id]);
       } catch (e) {
