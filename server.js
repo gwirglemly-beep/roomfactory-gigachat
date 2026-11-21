@@ -144,13 +144,12 @@ async function yookassaRequest(method, path, body, idempotenceKey) {
 // Лимит бесплатных генераций: GEN_LIMIT_TOTAL за всё время на аккаунт (счётчик в БД, users.generations_used).
 // Для гостей без входа — тот же лимит на IP (в памяти сервера, сбрасывается при перезапуске).
 // DAILY_LIMIT_GLOBAL — только защита бюджета: общий потолок генераций в сутки.
-const GEN_LIMIT_TOTAL = parseInt(process.env.GEN_LIMIT_TOTAL || '3', 10);
+const GEN_LIMIT_TOTAL = parseInt(process.env.GEN_LIMIT_TOTAL || '2', 10);
 const DAILY_LIMIT_GLOBAL = parseInt(process.env.DAILY_LIMIT_GLOBAL || '300', 10);
 // UNLIMITED_EMAILS — почты через запятую (в Render), у которых нет лимита на аккаунт (владелец, тестирование).
 const UNLIMITED_EMAILS = (process.env.UNLIMITED_EMAILS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 let usageDay = '';
 let usageGlobal = 0;
-const usageByIp = new Map();
 
 function moscowDay() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Moscow' });
@@ -204,12 +203,10 @@ async function reserveGeneration(req, res) {
     return { userId, source: 'free' };
   }
 
-  const ip = req.ip || 'unknown';
-  const used = usageByIp.get(ip) || 0;
-  if (used >= GEN_LIMIT_TOTAL) { res.status(429).json({ error: 'limit_reached' }); return null; }
-  usageByIp.set(ip, used + 1);
-  usageGlobal++;
-  return { ip };
+  // Без регистрации сюда дойти нельзя — requireAuth на /generate и /generate-apartment
+  // отклоняет анонимные запросы раньше, чем вызывается эта функция.
+  res.status(401).json({ error: 'not_authenticated' });
+  return null;
 }
 
 async function releaseGeneration(reserved) {
@@ -223,9 +220,6 @@ async function releaseGeneration(reserved) {
       } else {
         await pool.query('UPDATE users SET generations_used = GREATEST(generations_used - 1, 0) WHERE id = $1', [reserved.userId]);
       }
-    } else if (reserved.ip) {
-      const used = usageByIp.get(reserved.ip) || 0;
-      if (used > 0) usageByIp.set(reserved.ip, used - 1);
     }
   } catch (e) { console.error(e); }
   if (usageGlobal > 0) usageGlobal--;
@@ -401,7 +395,7 @@ async function checkReferencePhoto(buffer, mimetype) {
   }
 }
 
-app.post('/generate', upload.single('image'), async (req, res) => {
+app.post('/generate', requireAuth, upload.single('image'), async (req, res) => {
   let reserved = null;
   try {
     if (PAUSE_GOOGLE_GENERATION) { res.status(503).json({ error: 'generation_temporarily_paused' }); return; }
@@ -467,7 +461,7 @@ app.post('/classify-style', upload.single('image'), async (req, res) => {
   }
 });
 
-app.post('/generate-apartment', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'apartmentPhotos', maxCount: 7 }]), async (req, res) => {
+app.post('/generate-apartment', requireAuth, upload.fields([{ name: 'image', maxCount: 1 }, { name: 'apartmentPhotos', maxCount: 7 }]), async (req, res) => {
   let reserved = null;
   try {
     if (PAUSE_GOOGLE_GENERATION) { res.status(503).json({ error: 'generation_temporarily_paused' }); return; }
