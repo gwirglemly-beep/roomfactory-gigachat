@@ -107,7 +107,10 @@ const TARIFF_PLANS = {
   plus: { amount: 499, generations: 20, label: 'Plus' },
   pro: { amount: 999, generations: 50, label: 'Pro' }
 };
-const TOPUP_PLAN = { amount: 349, generations: 10, label: 'Докупка генераций' };
+const TOPUP_PLANS = {
+  topup1: { amount: 45, generations: 1, label: 'Докупка 1 генерации' },
+  topup: { amount: 349, generations: 10, label: 'Докупка генераций' }
+};
 
 // Кассовый чек (обязателен по 54-ФЗ) — отправляется покупателю на email через фискализацию ЮKassa.
 // vat_code: 1 — "без НДС" (УСН у ИП). Если в будущем появится НДС — поменять здесь.
@@ -517,11 +520,45 @@ app.post('/generate-apartment', requireAuth, upload.fields([{ name: 'image', max
   }
 });
 
+// Замена одного предмета в уже готовом дизайне — отдельная генерация (списывает такую же
+// генерацию, как обычная), но на вход идёт не исходное фото комнаты, а уже готовый результат
+// + фото нового товара; меняется только этот предмет, остальное остаётся как было.
+app.post('/replace-item', requireAuth, upload.single('image'), async (req, res) => {
+  let reserved = null;
+  try {
+    if (PAUSE_GOOGLE_GENERATION) { res.status(503).json({ error: 'generation_temporarily_paused' }); return; }
+    if (!req.file) { res.status(400).json({ error: 'no image' }); return; }
+    { const cleaned = await stripImageMetadata(req.file.buffer, req.file.mimetype); req.file.buffer = cleaned.buffer; req.file.mimetype = cleaned.mimetype; }
+    const roomCheck = await checkRoomPhoto(req.file.buffer, req.file.mimetype);
+    if (!roomCheck.ok) { res.status(400).json({ error: 'photo_rejected', reason: roomCheck.reason || 'Не удалось обработать изображение.' }); return; }
+
+    const oldItemName = String(req.body.oldItemName || '').slice(0, 200);
+    const newItemName = String(req.body.newItemName || '').slice(0, 200);
+    const newItemImageUrl = String(req.body.newItemImageUrl || '').slice(0, 500);
+    if (!newItemImageUrl) { res.status(400).json({ error: 'no_new_item' }); return; }
+
+    reserved = await reserveGeneration(req, res);
+    if (!reserved) return;
+
+    const relayResult = await callRelay('/replace-item', {
+      oldItemName, newItemName, newItemImageUrl,
+      mainImage: { data: req.file.buffer.toString('base64'), mimetype: req.file.mimetype }
+    });
+    const resultBuffer = Buffer.from(relayResult.image, 'base64');
+    res.set('Content-Type', relayResult.mimeType);
+    res.send(resultBuffer);
+  } catch (err) {
+    await releaseGeneration(reserved);
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 const SUPPORT_SYSTEM_PROMPT_RU = 'Ты — дружелюбный ассистент поддержки сайта Room Factory. Room Factory — это сайт, где пользователь загружает фото своей комнаты, а ИИ создаёт варианты дизайна интерьера в выбранном стиле (скандинавский, минимализм, лофт, классика, japandi, бохо) за 30 секунд. ' +
   'Пользователь может выбрать тип комнаты, цветовую гамму, бюджет ремонта, магазин мебели (Mebbery) — после генерации сайт показывает похожую мебель из этого каталога. ' +
   'Есть тест на определение подходящего стиля (сравнение пар фото), и отдельный раздел «Стиль квартиры» (в боковом меню) — там можно загрузить фото комнаты для переделки плюс несколько фото других комнат квартиры, и ИИ подберёт дизайн, вписывающийся в общий стиль всей квартиры. ' +
   'Есть личный кабинет с историей сгенерированных дизайнов. Сейчас все основные функции сайта бесплатны. ' +
-  'Отвечай кратко и дружелюбно, по-русски (если пользователь не написал на другом языке — тогда отвечай на его языке). Если вопрос не связан с сайтом Room Factory или ты не знаешь точного ответа — вежливо предложи написать на center@room-factory.ru. Не выдумывай факты о сервисе, которых нет в этом описании. Не давай юридических, налоговых или медицинских консультаций.';
+  'Отвечай МАКСИМАЛЬНО КОРОТКО — 1-3 предложения, без длинных списков и вступлений, по-русски (если пользователь не написал на другом языке — тогда отвечай на его языке). Если вопрос не связан с сайтом Room Factory или ты не знаешь точного ответа — вежливо предложи написать на help@room-factory.ru. Не выдумывай факты о сервисе, которых нет в этом описании. Не давай юридических, налоговых или медицинских консультаций.';
 
 app.post('/support-chat', express.json(), async (req, res) => {
   try {
@@ -855,12 +892,12 @@ app.get('/auth/me', requireAuth, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT id, email, first_name, last_name, phone, preferred_style,
               tariff, tariff_period_end, tariff_generations_limit, tariff_generations_used,
-              topup_generations, (yookassa_payment_method_id IS NOT NULL) AS has_saved_payment_method
+              generations_used, topup_generations, (yookassa_payment_method_id IS NOT NULL) AS has_saved_payment_method
        FROM users WHERE id = $1`,
       [req.user.id]
     );
     if (!rows.length) { res.status(401).json({ error: 'not_authenticated' }); return; }
-    res.json({ user: rows[0] });
+    res.json({ user: { ...rows[0], free_generations_limit: GEN_LIMIT_TOTAL } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'server_error' });
@@ -946,7 +983,8 @@ app.post('/auth/reset-password', authRateLimit('reset-password', 10, 15 * 60 * 1
 app.post('/payments/create', requireAuth, express.json(), async (req, res) => {
   try {
     const planKey = String(req.body.plan || '');
-    const plan = planKey === 'topup' ? TOPUP_PLAN : TARIFF_PLANS[planKey];
+    const isTopup = Object.prototype.hasOwnProperty.call(TOPUP_PLANS, planKey);
+    const plan = isTopup ? TOPUP_PLANS[planKey] : TARIFF_PLANS[planKey];
     if (!plan) { res.status(400).json({ error: 'invalid_plan' }); return; }
 
     const idempotenceKey = crypto.randomUUID();
@@ -954,7 +992,7 @@ app.post('/payments/create', requireAuth, express.json(), async (req, res) => {
       amount: { value: plan.amount.toFixed(2), currency: 'RUB' },
       capture: true,
       confirmation: { type: 'redirect', return_url: YOOKASSA_RETURN_URL },
-      save_payment_method: planKey !== 'topup' && YOOKASSA_RECURRING_ENABLED,
+      save_payment_method: !isTopup && YOOKASSA_RECURRING_ENABLED,
       description: 'Room Factory — ' + plan.label,
       metadata: { userId: String(req.user.id), plan: planKey },
       receipt: buildReceipt(req.user.email, plan)
@@ -992,8 +1030,8 @@ app.post('/payments/webhook', express.json(), async (req, res) => {
 
     await pool.query('UPDATE payments SET status = $1 WHERE yookassa_payment_id = $2', ['succeeded', paymentId]);
 
-    if (planKey === 'topup') {
-      await pool.query('UPDATE users SET topup_generations = topup_generations + $1 WHERE id = $2', [TOPUP_PLAN.generations, userId]);
+    if (TOPUP_PLANS[planKey]) {
+      await pool.query('UPDATE users SET topup_generations = topup_generations + $1 WHERE id = $2', [TOPUP_PLANS[planKey].generations, userId]);
     } else if (TARIFF_PLANS[planKey]) {
       const plan = TARIFF_PLANS[planKey];
       await pool.query(
@@ -1102,7 +1140,7 @@ async function uploadDesignImage(userId, buffer, mimetype) {
 app.get('/generations', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT id, image_url, style_key, style_label, room_label, store_label, furniture, created_at FROM generations WHERE user_id = $1 ORDER BY created_at DESC',
+      'SELECT id, name, image_url, style_key, style_label, room_label, store_label, furniture, share_code, created_at FROM generations WHERE user_id = $1 ORDER BY created_at DESC',
       [req.user.id]
     );
     res.json({ generations: rows });
@@ -1135,12 +1173,27 @@ app.post('/generations', requireAuth, upload.single('image'), async (req, res) =
       } catch (e) { /* игнорируем некорректный JSON мебели, дизайн всё равно сохраняем */ }
     }
     const { rows } = await pool.query(
-      'INSERT INTO generations (user_id, image_url, style_key, style_label, room_label, store_label, furniture) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, image_url, style_key, style_label, room_label, store_label, furniture, created_at',
+      'INSERT INTO generations (user_id, image_url, style_key, style_label, room_label, store_label, furniture) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name, image_url, style_key, style_label, room_label, store_label, furniture, share_code, created_at',
       [req.user.id, imageUrl, req.body.styleKey || null, req.body.styleLabel || null, req.body.roomLabel || null, req.body.storeLabel || null, furniture ? JSON.stringify(furniture) : null]
     );
     res.json({ generation: rows[0] });
   } catch (err) {
     console.error(err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.patch('/generations/:id', requireAuth, express.json(), async (req, res) => {
+  try {
+    const name = String((req.body && req.body.name) || '').trim().slice(0, 100) || null;
+    const { rows } = await pool.query(
+      'UPDATE generations SET name = $1 WHERE id = $2 AND user_id = $3 RETURNING id, name',
+      [name, req.params.id, req.user.id]
+    );
+    if (!rows.length) { res.status(404).json({ error: 'not_found' }); return; }
+    res.json({ generation: rows[0] });
+  } catch (err) {
+    console.error('PATCH /generations/:id error:', err);
     res.status(500).json({ error: 'server_error' });
   }
 });
@@ -1166,6 +1219,174 @@ app.delete('/generations/:id', requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Избранная мебель — доступно только зарегистрированным. Храним только то, что нужно
+// для показа карточки (фото/цена/ссылка), без привязки к конкретной генерации.
+app.get('/favorites', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, name, img, price, url, created_at FROM favorites WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json({ favorites: rows });
+  } catch (err) {
+    console.error('GET /favorites error:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/favorites/toggle', requireAuth, express.json(), async (req, res) => {
+  try {
+    const url = String((req.body && req.body.url) || '').trim().slice(0, 500);
+    if (!url) { res.status(400).json({ error: 'no_url' }); return; }
+    const name = String((req.body && req.body.name) || '').trim().slice(0, 200);
+    const img = String((req.body && req.body.img) || '').trim().slice(0, 500);
+    const price = String((req.body && req.body.price) || '').trim().slice(0, 50);
+
+    const existing = await pool.query('SELECT id FROM favorites WHERE user_id = $1 AND url = $2', [req.user.id, url]);
+    if (existing.rows.length) {
+      await pool.query('DELETE FROM favorites WHERE id = $1', [existing.rows[0].id]);
+      res.json({ favorited: false });
+      return;
+    }
+    const { rows } = await pool.query(
+      'INSERT INTO favorites (user_id, name, img, price, url) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+      [req.user.id, name, img, price, url]
+    );
+    res.json({ favorited: true, id: rows[0].id });
+  } catch (err) {
+    console.error('POST /favorites/toggle error:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.delete('/favorites/:id', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'DELETE FROM favorites WHERE id = $1 AND user_id = $2 RETURNING id',
+      [req.params.id, req.user.id]
+    );
+    if (!rows.length) { res.status(404).json({ error: 'not_found' }); return; }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /favorites/:id error:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Включение/выключение публичной ссылки «Поделиться» для сохранённого дизайна.
+// Код генерируется один раз и хранится, пока доступ не выключат — выключение
+// просто обнуляет share_code, старая ссылка перестаёт работать.
+app.post('/generations/:id/share', requireAuth, express.json(), async (req, res) => {
+  try {
+    const enabled = !!(req.body && req.body.enabled);
+    if (!enabled) {
+      const { rows } = await pool.query(
+        'UPDATE generations SET share_code = NULL WHERE id = $1 AND user_id = $2 RETURNING id',
+        [req.params.id, req.user.id]
+      );
+      if (!rows.length) { res.status(404).json({ error: 'not_found' }); return; }
+      res.json({ shareCode: null });
+      return;
+    }
+
+    const existing = await pool.query('SELECT share_code FROM generations WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    if (!existing.rows.length) { res.status(404).json({ error: 'not_found' }); return; }
+    if (existing.rows[0].share_code) { res.json({ shareCode: existing.rows[0].share_code }); return; }
+
+    let code = null;
+    for (let attempt = 0; attempt < 5 && !code; attempt++) {
+      const candidate = crypto.randomBytes(6).toString('base64url');
+      try {
+        await pool.query('UPDATE generations SET share_code = $1 WHERE id = $2', [candidate, req.params.id]);
+        code = candidate;
+      } catch (e) {
+        if (e.code !== '23505') throw e;
+      }
+    }
+    if (!code) { res.status(500).json({ error: 'server_error' }); return; }
+    res.json({ shareCode: code });
+  } catch (err) {
+    console.error('generations/share error:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Публичная страница дизайна — без авторизации, без исходного фото и без каких-либо
+// данных пользователя: только итоговая картинка, товары и ссылка на создание своего дизайна.
+// OG-теги заполняются здесь же на сервере, чтобы мессенджеры (Telegram/WhatsApp) показывали
+// превью с самой картинкой — им нужна готовая HTML-страница, а не SPA с JS.
+app.get('/d/:code', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT image_url, furniture FROM generations WHERE share_code = $1',
+      [req.params.code]
+    );
+    if (!rows.length) {
+      res.status(404).send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Дизайн не найден — Room Factory</title></head><body style="font-family:Arial,sans-serif;max-width:480px;margin:80px auto;text-align:center;color:#1a1208"><p>Эта ссылка больше не активна.</p><p><a href="https://room-factory.ru/">На главную Room Factory</a></p></body></html>');
+      return;
+    }
+    const gen = rows[0];
+    const furniture = Array.isArray(gen.furniture) ? gen.furniture : (gen.furniture ? JSON.parse(gen.furniture) : []);
+    const total = furniture.reduce((sum, p) => sum + (parseInt(String(p.price || '').replace(/[^\d]/g, ''), 10) || 0), 0);
+    const pageUrl = 'https://room-factory.ru/d/' + encodeURIComponent(req.params.code);
+    const description = 'Посмотри, какой интерьер получился в Room Factory 👀';
+
+    const productsHtml = furniture.map(p =>
+      '<a class="card" href="' + escapeHtml(p.url || '#') + '" target="_blank" rel="noopener">' +
+        '<img src="' + escapeHtml(p.img || '') + '" alt="' + escapeHtml(p.name || '') + '" loading="lazy">' +
+        '<div class="card-info"><div class="card-name">' + escapeHtml(p.name || '') + '</div><div class="card-price">' + escapeHtml(p.price || '') + '</div></div>' +
+      '</a>'
+    ).join('');
+
+    res.send(`<!doctype html><html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Дизайн интерьера — Room Factory</title>
+<meta name="robots" content="noindex">
+<meta property="og:title" content="Room Factory">
+<meta property="og:description" content="${escapeHtml(description)}">
+<meta property="og:image" content="${escapeHtml(gen.image_url)}">
+<meta property="og:url" content="${escapeHtml(pageUrl)}">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Room Factory">
+<meta name="twitter:description" content="${escapeHtml(description)}">
+<meta name="twitter:image" content="${escapeHtml(gen.image_url)}">
+<style>
+body{margin:0;background:#f5f2ed;color:#1a1208;font-family:Inter,Arial,sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:24px 20px 56px}
+.brand{font-weight:800;letter-spacing:2px;text-transform:uppercase;font-size:13px;color:#b48c5a;margin-bottom:20px}
+img.hero{width:100%;border-radius:12px;display:block;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}
+.card{display:block;text-decoration:none;background:#faf7f2;border:1px solid rgba(42,34,24,0.1);border-radius:8px;overflow:hidden}
+.card img{width:100%;aspect-ratio:1/1;object-fit:cover;display:block;background:#eee8df}
+.card-info{padding:8px}
+.card-name{font-size:10px;color:#1a1208;line-height:1.3;margin-bottom:4px}
+.card-price{font-size:11px;font-weight:700;color:#b48c5a}
+.total{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;background:#2d2318;color:#f5f2ed;border-radius:8px;margin-bottom:28px}
+.total strong{font-size:18px;color:#d4ad7a}
+.cta{display:block;text-align:center;background:#b48c5a;color:#fff;text-decoration:none;padding:16px;border-radius:8px;font-weight:700;letter-spacing:1px;text-transform:uppercase;font-size:13px}
+@media (max-width:480px){.grid{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head><body>
+<div class="wrap">
+  <div class="brand">Room Factory</div>
+  <img class="hero" src="${escapeHtml(gen.image_url)}" alt="Дизайн интерьера">
+  ${furniture.length ? '<div class="grid">' + productsHtml + '</div>' : ''}
+  ${total ? '<div class="total"><span>Смета покупки</span><strong>' + total.toLocaleString('ru-RU') + ' ₽</strong></div>' : ''}
+  <a class="cta" href="https://room-factory.ru/">Создать свой дизайн</a>
+</div>
+</body></html>`);
+  } catch (err) {
+    console.error('GET /d/:code error:', err);
+    res.status(500).send('Server error');
   }
 });
 
