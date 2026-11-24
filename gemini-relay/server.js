@@ -147,7 +147,7 @@ function mountHint(name) {
   return '';
 }
 
-async function inspectResult(resultImage, referenceParts, palette) {
+async function inspectResult(resultImage, referenceParts, palette, userComment) {
   const client = getGeminiClient();
   const parts = [{ text: 'The first image is a photo of a designed room.' + (referenceParts.length ? ' After it come ' + referenceParts.length + ' numbered product photos from a furniture catalog.' : '') }];
   parts.push({ inlineData: { mimeType: resultImage.mimetype || 'image/jpeg', data: resultImage.buffer.toString('base64') } });
@@ -158,7 +158,8 @@ async function inspectResult(resultImage, referenceParts, palette) {
   parts.push({ text: 'Task 1: which of the numbered products appear in the designed room photo? A product counts if an item of the same type and a similar color is visible; the exact design may differ slightly. If there are no products, use an empty list. ' +
     'Task 2: does the room photo contain a clear physical or realism defect' + (referenceParts.length ? ', including any numbered product that is clearly missing from the room' : '') + ', for example a ceiling light, chandelier or pendant lamp standing on the floor or on furniture, furniture floating in the air or at the wrong scale for the room, a television floating in mid-air or hanging only on visible cables with no wall or stand support, a wall-mounted item lying on the floor, or a clearly deformed object' + (referenceParts.length ? ', or any piece of furniture or lamp that is NOT one of the numbered products (for example an extra wardrobe, shelf, table, bed or chandelier)' : '') + '? ' +
     (palette ? 'Task 3: the requested color palette is: ' + palette + '. Does the room clearly violate this palette, for example saturated green, red or blue furniture or decor in a monochrome palette? If yes, treat it as a defect and name the offending items and colors. ' : '') +
-    'Answer with ONLY a JSON object like {"products":[1,3],"defect":null}. Put a short English sentence in "defect" only for a clear defect or palette violation, otherwise null.' });
+    (userComment ? 'Task 4: the user specifically requested: "' + userComment + '". Does the room clearly fail to follow this request (for example a requested item is missing, or the wrong item was added instead)? If yes, treat it as a defect and say exactly what is missing or wrong. ' : '') +
+    'Answer with ONLY a JSON object like {"products":[1,3],"defect":null}. Put a short English sentence in "defect" only for a clear defect, palette violation or unmet user request, otherwise null.' });
   for (const model of verifyModelOrder()) {
     try {
       const response = await client.models.generateContent({ model, contents: [{ role: 'user', parts }] });
@@ -179,14 +180,14 @@ async function inspectResult(resultImage, referenceParts, palette) {
   return null;
 }
 
-async function generateChecked(promptText, images, referenceParts, palette) {
+async function generateChecked(promptText, images, referenceParts, palette, userComment) {
   let gen = await generateWithGemini(promptText, images);
-  let info = await inspectResult({ buffer: gen.buffer, mimetype: gen.mimeType }, referenceParts, palette);
+  let info = await inspectResult({ buffer: gen.buffer, mimetype: gen.mimeType }, referenceParts, palette, userComment);
   if (info && info.defect) {
     console.log('defect found, regenerating once:', info.defect);
     try {
       const retry = await generateWithGemini(promptText + ' IMPORTANT: the previous attempt had this defect, fix it this time: ' + info.defect + '. Ceiling lights always hang from the ceiling, all furniture stands naturally on the floor at the correct scale, and any television is either flush on the wall or resting on a stand — never floating on cables.', images);
-      const info2 = await inspectResult({ buffer: retry.buffer, mimetype: retry.mimeType }, referenceParts, palette);
+      const info2 = await inspectResult({ buffer: retry.buffer, mimetype: retry.mimeType }, referenceParts, palette, userComment);
       gen = retry; info = info2;
     } catch (e) {
       console.error('regeneration failed, keeping first result:', e && e.message);
@@ -201,7 +202,8 @@ const FURNITURE_ARRANGEMENT_RULES = 'Arrange the furniture the way a professiona
   'group pieces into clear functional zones that make sense for this room (for example a seating group facing a shared focal point such as the TV, a coffee table or a window; a bed centered against its main wall with nightstands symmetrically on both sides; a dining or work area kept separate from the seating area). ' +
   'Keep a clear, unobstructed walking path from the door to the rest of the room and between the main zones — do not block doorways, windows or walkways with furniture. ' +
   'Large pieces (sofas, beds, wardrobes, dining tables) anchor the room against walls or in natural zones; do not place them floating awkwardly in the middle of open floor space or bunched together in one corner while the rest of the room is empty. ' +
-  'Balance visual weight across the room instead of crowding every piece on one side, and keep spacing between furniture pieces realistic and consistent, as in a real lived-in, professionally arranged room.';
+  'Balance visual weight across the room instead of crowding every piece on one side, and keep spacing between furniture pieces realistic and consistent, as in a real lived-in, professionally arranged room. ' +
+  'The whole room must look like one harmonious, polished, magazine-quality interior photo: every piece of furniture and decor should share a coherent sense of style, finish and proportion with the rest of the room, not look like unrelated items placed next to each other — if a piece\'s finish or shape clashes with the overall look, adapt its color to the palette while keeping the result elegant and cohesive.';
 
 function buildStrictRules(refCount, palette) {
   if (!refCount) return '';
@@ -348,7 +350,7 @@ app.post('/generate', requireSharedSecret, async (req, res) => {
 
     const images = [mainImage].concat(userRef ? [userRef] : []).concat(referenceParts);
 
-    const { buffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + buildStrictRules(referenceParts.length, palette) + ' ' + refNamesText, images, referenceParts, palette);
+    const { buffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + buildStrictRules(referenceParts.length, palette) + ' ' + refNamesText, images, referenceParts, palette, userComment);
     res.json({ image: buffer.toString('base64'), mimeType, matched, refOrigIndex });
   } catch (err) {
     console.error(err);
@@ -393,7 +395,7 @@ app.post('/generate-apartment', requireSharedSecret, async (req, res) => {
 
     const images = [targetImage].concat(styleImages).concat(userRef ? [userRef] : []).concat(referenceParts);
 
-    const { buffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + buildStrictRules(referenceParts.length, palette) + ' ' + refNamesText, images, referenceParts, palette);
+    const { buffer, mimeType, matched } = await generateChecked(fullPrompt + ' ' + buildStrictRules(referenceParts.length, palette) + ' ' + refNamesText, images, referenceParts, palette, userComment);
     res.json({ image: buffer.toString('base64'), mimeType, matched, refOrigIndex });
   } catch (err) {
     console.error(err);
